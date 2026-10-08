@@ -1,0 +1,20 @@
+{
+  "functions": [
+    {
+      "symbol": "fork_memory_probe",
+      "section": ".gsfork_fork_memory"
+    },
+    {
+      "symbol": "fork_indirect_call",
+      "section": ".gsfork_fork_call"
+    },
+    {
+      "symbol": "fork_indirect_jump",
+      "section": ".gsfork_fork_jump"
+    },
+    {
+      "symbol": "fork_rip_probe",
+      "section": ".gsfork_fork_rip"
+    }
+  ]
+}

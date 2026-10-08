@@ -1,6 +1,6 @@
 import unittest
 from iced_x86 import Decoder, Register, FlowControl, Mnemonic
-from rewrite import transform, Unsupported
+from rewrite import transform, transform_fork, Unsupported
 
 class RewriteTests(unittest.TestCase):
     def test_load_store_and_lea(self):
@@ -39,3 +39,65 @@ class RewriteTests(unittest.TestCase):
         for name,code in patterns.items():
             with self.subTest(name=name), self.assertRaises(Unsupported):
                 transform(bytes.fromhex(code),0x1000)
+
+    def test_fork_mode_rewrites_non_stack_non_rip_memory(self):
+        code = bytes.fromhex(
+            '488b07'          # mov rax,[rdi]
+            '488918'          # mov [rax],rbx
+            '488b442408'      # mov rax,[rsp+8]
+            '488b0500000000'  # mov rax,[rip]
+            '488b45f8'        # mov rax,[rbp-8]
+            'c3'
+        )
+        out, edits = transform_fork(code, 0x1000)
+        ins = list(Decoder(64, out, ip=0x1000))
+        self.assertEqual(len(edits), 3)
+        self.assertEqual(
+            [item.segment_prefix for item in ins],
+            [
+                Register.GS,
+                Register.GS,
+                Register.NONE,
+                Register.NONE,
+                Register.GS,
+                Register.NONE,
+            ],
+        )
+
+    def test_fork_mode_rewrites_memory_indirect_control_flow(self):
+        for code in ('ff10', 'ff27'):
+            with self.subTest(code=code):
+                out, edits = transform_fork(bytes.fromhex(code), 0x1000)
+                instruction = next(iter(Decoder(64, out, ip=0x1000)))
+                self.assertEqual(len(edits), 1)
+                self.assertEqual(instruction.segment_prefix, Register.GS)
+
+    def test_fork_mode_keeps_rsp_indirect_call_native(self):
+        out, edits = transform_fork(bytes.fromhex('ff1424'), 0x1000)
+        instruction = next(iter(Decoder(64, out, ip=0x1000)))
+        self.assertEqual(edits, [])
+        self.assertEqual(instruction.segment_prefix, Register.NONE)
+
+    def test_fork_mode_rewrites_absolute_memory(self):
+        code = bytes.fromhex('48a10010000000000000c3')
+        out, edits = transform_fork(code, 0x1000)
+        instruction = next(iter(Decoder(64, out, ip=0x1000)))
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(instruction.segment_prefix, Register.GS)
+
+    def test_fork_mode_keeps_implicit_stack_native(self):
+        code = bytes.fromhex('5058e800000000c3')
+        out, edits = transform_fork(code, 0x1000)
+        self.assertEqual(edits, [])
+        self.assertEqual(
+            [item.segment_prefix for item in Decoder(64, out, ip=0x1000)],
+            [Register.NONE] * 4,
+        )
+
+    def test_fork_mode_rejects_multi_memory_string_instruction(self):
+        with self.assertRaises(Unsupported):
+            transform_fork(bytes.fromhex('f3a4c3'), 0x1000)
+
+    def test_fork_mode_rejects_implicit_rbp_stack_access(self):
+        with self.assertRaises(Unsupported):
+            transform_fork(bytes.fromhex('c9c3'), 0x1000)

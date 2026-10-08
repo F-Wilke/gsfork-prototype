@@ -33,6 +33,18 @@ make mibench-binary-perf PROFILE_ARGS="--seconds 1 --repeat 3"
 
 See the "Binary-rewritten implementation" section in `MIBENCH.md`.
 
+## Fork-oriented rewriting
+
+`FORK.md` documents the broader `--fork-manifest` policy: all explicit memory
+operands become GS-relative except RIP- and RSP-based accesses. It includes an
+actual-fork validation with a reserved child-stack range, a GS alias of the
+child stack, a GS alias of the parent's pre-fork stack page, translated
+loads/stores, and memory-indirect CALL/JMP:
+
+```sh
+make fork-test
+```
+
 ## Run
 
 Requirements: Linux x86-64, GCC, GNU ld/binutils, Python 3.10+, AVX2 for the vector test, and permission to use `arch_prctl(ARCH_SET_GS)`. No root required. The executable reserves two fixed virtual ranges using `MAP_FIXED_NOREPLACE`; it fails without replacing anything if either range is occupied.
@@ -111,6 +123,8 @@ The environment is a KVM VM. CPU pinning does not pin the host's physical CPU or
 - `profile.py`, `PERF.md`: perf runner and attribution guide.
 - `mibench_build.py`, `mibench_profile.py`, `MIBENCH.md`: MiBench build,
   validation, and paired perf evaluation.
+- `fork_validate.py`, `fork_slots.ld`, `FORK.md`: fork-oriented rewrite policy
+  and address-space topology validation.
 - `results-v1/`, `reference-v1.zip`: historical measurements and matching package.
 - `REPORT.md`: measured results and interpretation.
 - `build/`: original, rewritten, control binaries and edit reports.

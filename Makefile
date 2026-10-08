@@ -2,7 +2,7 @@ CC = gcc
 PYTHON ?= python3
 CFLAGS = -O3 -Wall -Wextra -Werror -fno-pie -fno-stack-protector -fcf-protection=none -fno-asynchronous-unwind-tables -fno-unwind-tables
 KFLAGS = -fno-tree-vectorize -fno-tree-loop-distribute-patterns -mno-red-zone
-.PHONY: all test bench perf-stat perf-record perf-sweep perf-doctor mibench-build mibench-test mibench-perf mibench-binary-build mibench-binary-test mibench-binary-perf clean
+.PHONY: all test bench perf-stat perf-record perf-sweep perf-doctor fork-test mibench-build mibench-test mibench-perf mibench-binary-build mibench-binary-test mibench-binary-perf clean
 KERNEL ?= chase
 SIZE ?= 32K
 SECONDS ?= 3
@@ -23,6 +23,7 @@ build/reencoded: build/original rewrite.py
 test: all
 	$(PYTHON) -m unittest discover -s tests -v
 	$(PYTHON) validate.py
+	$(PYTHON) fork_validate.py
 bench: test
 	$(PYTHON) benchmark.py --output results
 perf-stat: all
@@ -33,6 +34,8 @@ perf-sweep: all
 	$(PYTHON) profile.py sweep --kernel $(KERNEL) --seconds $(SECONDS) $(PROFILE_ARGS)
 perf-doctor:
 	$(PYTHON) profile.py doctor $(PROFILE_ARGS)
+fork-test:
+	$(PYTHON) fork_validate.py
 mibench-build:
 	$(PYTHON) mibench_build.py $(if $(MIBENCH_SOURCE),--source $(MIBENCH_SOURCE),)
 mibench-test: mibench-build
