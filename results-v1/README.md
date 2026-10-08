@@ -1,0 +1,1 @@
+These are the original Xeon/KVM v1 measurements. Matching binaries, sources, and hashes are preserved in ../reference-v1.zip. The active build/ directory is rebuilt for the profiling extension and its ELF hashes differ. Do not interpret these files as a new perf collection.

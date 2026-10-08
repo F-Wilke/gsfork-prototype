@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+build/
+results/
+
+profiles/*
+!profiles/20261007-comprehensive-analysis.md
+!profiles/20261007-comprehensive-metrics.csv
+!profiles/20261007-mibench-analysis.md
+!profiles/20261007-mibench-metrics.csv

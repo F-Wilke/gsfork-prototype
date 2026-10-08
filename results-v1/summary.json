@@ -1,0 +1,418 @@
+[
+  {
+    "kernel": "sum",
+    "bytes": 32768,
+    "rounds": 35096,
+    "samples": 31,
+    "variants": {
+      "original": {
+        "median_wall_ns": 54878226,
+        "median_thread_ns": 54866149,
+        "wall_ratio": 1.0,
+        "wall_ratio_ci95": [
+          1.0,
+          1.0
+        ],
+        "thread_ratio": 1.0,
+        "median_ns_per_element": 0.3817530315286998
+      },
+      "reencoded": {
+        "median_wall_ns": 55753984,
+        "median_thread_ns": 55745527,
+        "wall_ratio": 0.9678516550827333,
+        "wall_ratio_ci95": [
+          0.9455885297923751,
+          1.0435412730292335
+        ],
+        "thread_ratio": 0.9680687355344175,
+        "median_ns_per_element": 0.38784512480054706
+      },
+      "gs_zero": {
+        "median_wall_ns": 56342016,
+        "median_thread_ns": 56304078,
+        "wall_ratio": 1.0242226155588752,
+        "wall_ratio_ci95": [
+          0.9467765871536875,
+          1.0955847340398337
+        ],
+        "thread_ratio": 1.0242027416916808,
+        "median_ns_per_element": 0.39193569067700024
+      },
+      "gs_shift": {
+        "median_wall_ns": 53924885,
+        "median_thread_ns": 53916537,
+        "wall_ratio": 0.9883813971568427,
+        "wall_ratio_ci95": [
+          0.946093874124011,
+          1.0184502959234654
+        ],
+        "thread_ratio": 0.9836465417214211,
+        "median_ns_per_element": 0.3751212425049329
+      }
+    }
+  },
+  {
+    "kernel": "sum",
+    "bytes": 8388608,
+    "rounds": 195,
+    "samples": 31,
+    "variants": {
+      "original": {
+        "median_wall_ns": 84512643,
+        "median_thread_ns": 84500012,
+        "wall_ratio": 1.0,
+        "wall_ratio_ci95": [
+          1.0,
+          1.0
+        ],
+        "thread_ratio": 1.0,
+        "median_ns_per_element": 0.4133207027728741
+      },
+      "reencoded": {
+        "median_wall_ns": 86997275,
+        "median_thread_ns": 86994955,
+        "wall_ratio": 1.0153331640727354,
+        "wall_ratio_ci95": [
+          0.9867231480938067,
+          1.098157115900212
+        ],
+        "thread_ratio": 1.01533497948929,
+        "median_ns_per_element": 0.4254721372555464
+      },
+      "gs_zero": {
+        "median_wall_ns": 85263458,
+        "median_thread_ns": 85252447,
+        "wall_ratio": 1.060491038084182,
+        "wall_ratio_ci95": [
+          0.9680426032723883,
+          1.081321469622387
+        ],
+        "thread_ratio": 1.0604945428233625,
+        "median_ns_per_element": 0.416992666782477
+      },
+      "gs_shift": {
+        "median_wall_ns": 84830831,
+        "median_thread_ns": 84778665,
+        "wall_ratio": 1.002079097206793,
+        "wall_ratio_ci95": [
+          0.9660949111997679,
+          1.0506525458534188
+        ],
+        "thread_ratio": 1.0020956210041723,
+        "median_ns_per_element": 0.41487684494409804
+      }
+    }
+  },
+  {
+    "kernel": "update",
+    "bytes": 32768,
+    "rounds": 71389,
+    "samples": 31,
+    "variants": {
+      "original": {
+        "median_wall_ns": 82046517,
+        "median_thread_ns": 82045105,
+        "wall_ratio": 1.0,
+        "wall_ratio_ci95": [
+          1.0,
+          1.0
+        ],
+        "thread_ratio": 1.0,
+        "median_ns_per_element": 0.28058787683611097
+      },
+      "reencoded": {
+        "median_wall_ns": 84978775,
+        "median_thread_ns": 84977212,
+        "wall_ratio": 1.024812022184927,
+        "wall_ratio_ci95": [
+          0.9665978727352821,
+          1.077440816571746
+        ],
+        "thread_ratio": 1.024815654754784,
+        "median_ns_per_element": 0.29061579851565894
+      },
+      "gs_zero": {
+        "median_wall_ns": 83854069,
+        "median_thread_ns": 83842165,
+        "wall_ratio": 1.04313066115989,
+        "wall_ratio_ci95": [
+          0.9211397990270903,
+          1.0881746125927692
+        ],
+        "thread_ratio": 1.043134081573913,
+        "median_ns_per_element": 0.28676945768189954
+      },
+      "gs_shift": {
+        "median_wall_ns": 105903693,
+        "median_thread_ns": 105902106,
+        "wall_ratio": 1.2798021964359922,
+        "wall_ratio_ci95": [
+          1.1941869091701451,
+          1.3617186552105855
+        ],
+        "thread_ratio": 1.279821483879274,
+        "median_ns_per_element": 0.3621761587755554
+      }
+    }
+  },
+  {
+    "kernel": "update",
+    "bytes": 8388608,
+    "rounds": 221,
+    "samples": 31,
+    "variants": {
+      "original": {
+        "median_wall_ns": 90792150,
+        "median_thread_ns": 90789929,
+        "wall_ratio": 1.0,
+        "wall_ratio_ci95": [
+          1.0,
+          1.0
+        ],
+        "thread_ratio": 1.0,
+        "median_ns_per_element": 0.39179249586562764
+      },
+      "reencoded": {
+        "median_wall_ns": 90063352,
+        "median_thread_ns": 90054435,
+        "wall_ratio": 0.9838721884845005,
+        "wall_ratio_ci95": [
+          0.9078963762360684,
+          1.0505570206219956
+        ],
+        "thread_ratio": 0.9837370405481644,
+        "median_ns_per_element": 0.38864753688622383
+      },
+      "gs_zero": {
+        "median_wall_ns": 90705442,
+        "median_thread_ns": 90534355,
+        "wall_ratio": 0.9961813914717191,
+        "wall_ratio_ci95": [
+          0.9524252533032965,
+          1.0421129002339993
+        ],
+        "thread_ratio": 0.9961891259984555,
+        "median_ns_per_element": 0.391418327573198
+      },
+      "gs_shift": {
+        "median_wall_ns": 94790021,
+        "median_thread_ns": 94787700,
+        "wall_ratio": 1.0400265661733972,
+        "wall_ratio_ci95": [
+          1.0079432717689063,
+          1.1208842466941444
+        ],
+        "thread_ratio": 1.0400321493807976,
+        "median_ns_per_element": 0.4090443822593171
+      }
+    }
+  },
+  {
+    "kernel": "avx2",
+    "bytes": 32768,
+    "rounds": 122409,
+    "samples": 31,
+    "variants": {
+      "original": {
+        "median_wall_ns": 49873035,
+        "median_thread_ns": 49871635,
+        "wall_ratio": 1.0,
+        "wall_ratio_ci95": [
+          1.0,
+          1.0
+        ],
+        "thread_ratio": 1.0,
+        "median_ns_per_element": 0.09947008745718758
+      },
+      "reencoded": {
+        "median_wall_ns": 47969756,
+        "median_thread_ns": 47968589,
+        "wall_ratio": 0.9425252505789912,
+        "wall_ratio_ci95": [
+          0.9042701983709979,
+          0.9937957376512614
+        ],
+        "thread_ratio": 0.9425267459677541,
+        "median_ns_per_element": 0.0956740616371141
+      },
+      "gs_zero": {
+        "median_wall_ns": 49566466,
+        "median_thread_ns": 49564677,
+        "wall_ratio": 0.9825174311090422,
+        "wall_ratio_ci95": [
+          0.938797437385303,
+          1.0118405229767675
+        ],
+        "thread_ratio": 0.9825121393659145,
+        "median_ns_per_element": 0.09885864591885604
+      },
+      "gs_shift": {
+        "median_wall_ns": 48762954,
+        "median_thread_ns": 48761514,
+        "wall_ratio": 0.9648548360831194,
+        "wall_ratio_ci95": [
+          0.9414243455079065,
+          1.008394935824364
+        ],
+        "thread_ratio": 0.9649748827895918,
+        "median_ns_per_element": 0.09725606831528932
+      }
+    }
+  },
+  {
+    "kernel": "avx2",
+    "bytes": 8388608,
+    "rounds": 207,
+    "samples": 31,
+    "variants": {
+      "original": {
+        "median_wall_ns": 78886172,
+        "median_thread_ns": 78883352,
+        "wall_ratio": 1.0,
+        "wall_ratio_ci95": [
+          1.0,
+          1.0
+        ],
+        "thread_ratio": 1.0,
+        "median_ns_per_element": 0.3634382422995452
+      },
+      "reencoded": {
+        "median_wall_ns": 79539752,
+        "median_thread_ns": 79537826,
+        "wall_ratio": 1.0006746199729437,
+        "wall_ratio_ci95": [
+          0.967202211562979,
+          1.0510465359041508
+        ],
+        "thread_ratio": 1.0008454370255602,
+        "median_ns_per_element": 0.36644936529334615
+      },
+      "gs_zero": {
+        "median_wall_ns": 76984498,
+        "median_thread_ns": 76972505,
+        "wall_ratio": 0.9854674707795085,
+        "wall_ratio_ci95": [
+          0.9405990938905021,
+          1.049598415573414
+        ],
+        "thread_ratio": 0.9852025166963494,
+        "median_ns_per_element": 0.35467699760400156
+      },
+      "gs_shift": {
+        "median_wall_ns": 76167352,
+        "median_thread_ns": 76162560,
+        "wall_ratio": 0.9670384462248514,
+        "wall_ratio_ci95": [
+          0.9456732140578079,
+          0.9983592144419879
+        ],
+        "thread_ratio": 0.9677688503607693,
+        "median_ns_per_element": 0.35091230604383683
+      }
+    }
+  },
+  {
+    "kernel": "chase",
+    "bytes": 32768,
+    "rounds": 22452,
+    "samples": 31,
+    "variants": {
+      "original": {
+        "median_wall_ns": 86745406,
+        "median_thread_ns": 86728335,
+        "wall_ratio": 1.0,
+        "wall_ratio_ci95": [
+          1.0,
+          1.0
+        ],
+        "thread_ratio": 1.0,
+        "median_ns_per_element": 1.8865203667128763
+      },
+      "reencoded": {
+        "median_wall_ns": 80959266,
+        "median_thread_ns": 80957764,
+        "wall_ratio": 0.935212012348753,
+        "wall_ratio_ci95": [
+          0.9099709370755932,
+          0.9803276822736087
+        ],
+        "thread_ratio": 0.9359609317059739,
+        "median_ns_per_element": 1.760684642863108
+      },
+      "gs_zero": {
+        "median_wall_ns": 89083561,
+        "median_thread_ns": 89082256,
+        "wall_ratio": 1.030301766595235,
+        "wall_ratio_ci95": [
+          0.9393497574678245,
+          1.0842922619780797
+        ],
+        "thread_ratio": 1.030371850535218,
+        "median_ns_per_element": 1.9373700569896335
+      },
+      "gs_shift": {
+        "median_wall_ns": 120827586,
+        "median_thread_ns": 120818895,
+        "wall_ratio": 1.3660950725132714,
+        "wall_ratio_ci95": [
+          1.3081612939933964,
+          1.4431772545649701
+        ],
+        "thread_ratio": 1.3661033092702388,
+        "median_ns_per_element": 2.6277322611153795
+      }
+    }
+  },
+  {
+    "kernel": "chase",
+    "bytes": 8388608,
+    "rounds": 4,
+    "samples": 31,
+    "variants": {
+      "original": {
+        "median_wall_ns": 84229951,
+        "median_thread_ns": 84225605,
+        "wall_ratio": 1.0,
+        "wall_ratio_ci95": [
+          1.0,
+          1.0
+        ],
+        "thread_ratio": 1.0,
+        "median_ns_per_element": 40.16397047042847
+      },
+      "reencoded": {
+        "median_wall_ns": 85149451,
+        "median_thread_ns": 85145215,
+        "wall_ratio": 0.9881956764917292,
+        "wall_ratio_ci95": [
+          0.939516924493323,
+          1.0704495769974236
+        ],
+        "thread_ratio": 0.9882242502957427,
+        "median_ns_per_element": 40.60242223739624
+      },
+      "gs_zero": {
+        "median_wall_ns": 83504947,
+        "median_thread_ns": 83500897,
+        "wall_ratio": 1.0208561639586138,
+        "wall_ratio_ci95": [
+          0.9352230346575258,
+          1.0460274263152955
+        ],
+        "thread_ratio": 1.0209693230503223,
+        "median_ns_per_element": 39.81826162338257
+      },
+      "gs_shift": {
+        "median_wall_ns": 87546806,
+        "median_thread_ns": 87544568,
+        "wall_ratio": 0.9950070383724005,
+        "wall_ratio_ci95": [
+          0.9475730166727615,
+          1.1226097257985668
+        ],
+        "thread_ratio": 0.9949979313165165,
+        "median_ns_per_element": 41.74557018280029
+      }
+    }
+  }
+]
