@@ -2,7 +2,7 @@ CC = gcc
 PYTHON ?= python3
 CFLAGS = -O3 -Wall -Wextra -Werror -fno-pie -fno-stack-protector -fcf-protection=none -fno-asynchronous-unwind-tables -fno-unwind-tables
 KFLAGS = -fno-tree-vectorize -fno-tree-loop-distribute-patterns -mno-red-zone
-.PHONY: all test bench perf-stat perf-record perf-sweep perf-doctor fork-test mibench-build mibench-test mibench-perf mibench-binary-build mibench-binary-test mibench-binary-perf clean
+.PHONY: all test rewriter-test bench perf-stat perf-record perf-sweep perf-doctor fork-test mibench-build mibench-test mibench-perf mibench-binary-build mibench-binary-test mibench-binary-perf clean
 KERNEL ?= chase
 SIZE ?= 32K
 SECONDS ?= 3
@@ -22,6 +22,11 @@ build/reencoded: build/original rewrite.py
 	$(PYTHON) rewrite.py $< $@ --no-gs --report build/reencoded.json
 test: all
 	$(PYTHON) -m unittest discover -s tests -v
+	$(PYTHON) validate.py
+	$(PYTHON) fork_validate.py
+rewriter-test: all
+	$(PYTHON) rewrite_test_framework.py
+	$(PYTHON) -m unittest discover -s tests -p '*rewrite*.py' -v
 	$(PYTHON) validate.py
 	$(PYTHON) fork_validate.py
 bench: test

@@ -45,6 +45,12 @@ loads/stores, and memory-indirect CALL/JMP:
 make fork-test
 ```
 
+The consolidated rewriter test framework is documented in `TESTING.md`:
+
+```sh
+make rewriter-test
+```
+
 ## Run
 
 Requirements: Linux x86-64, GCC, GNU ld/binutils, Python 3.10+, AVX2 for the vector test, and permission to use `arch_prctl(ARCH_SET_GS)`. No root required. The executable reserves two fixed virtual ranges using `MAP_FIXED_NOREPLACE`; it fails without replacing anything if either range is occupied.
@@ -125,6 +131,8 @@ The environment is a KVM VM. CPU pinning does not pin the host's physical CPU or
   validation, and paired perf evaluation.
 - `fork_validate.py`, `fork_slots.ld`, `FORK.md`: fork-oriented rewrite policy
   and address-space topology validation.
+- `rewrite_test_framework.py`, `tests/rewrite_cases.json`, `TESTING.md`:
+  data-driven instruction tests and consolidated rewriter validation.
 - `results-v1/`, `reference-v1.zip`: historical measurements and matching package.
 - `REPORT.md`: measured results and interpretation.
 - `build/`: original, rewritten, control binaries and edit reports.

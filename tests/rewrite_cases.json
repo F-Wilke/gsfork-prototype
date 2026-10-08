@@ -1,0 +1,160 @@
+{
+  "cases": [
+    {
+      "name": "restricted-load-store-lea",
+      "policy": "restricted",
+      "hex": "488b07488907488d4708c3",
+      "expected": {
+        "edits": 2,
+        "segments": ["GS", "GS", "NONE", "NONE"],
+        "length_delta": 2
+      }
+    },
+    {
+      "name": "restricted-reencoding-control",
+      "policy": "restricted",
+      "hex": "488b074883c708c3",
+      "gs": false,
+      "expected": {
+        "edits": 1,
+        "segments": ["NONE", "NONE", "NONE"],
+        "length_delta": 0,
+        "output_hex": "488b074883c708c3"
+      }
+    },
+    {
+      "name": "restricted-prefixed-nop",
+      "policy": "restricted",
+      "hex": "66662e0f1f840000000000c3",
+      "expected": {
+        "edits": 0,
+        "segments": ["CS", "NONE"],
+        "length_delta": 0,
+        "output_hex": "66662e0f1f840000000000c3"
+      }
+    },
+    {
+      "name": "restricted-reject-stack-load",
+      "policy": "restricted",
+      "hex": "488b0424c3",
+      "error": "stack/frame register"
+    },
+    {
+      "name": "restricted-reject-direct-call",
+      "policy": "restricted",
+      "hex": "e800000000c3",
+      "error": "outside supported instruction subset"
+    },
+    {
+      "name": "fork-general-load-store-rsp-rip-rbp",
+      "policy": "fork",
+      "hex": "488b07488918488b442408488b0500000000488b45f8c3",
+      "expected": {
+        "edits": 3,
+        "segments": ["GS", "GS", "NONE", "NONE", "GS", "NONE"],
+        "length_delta": 3
+      }
+    },
+    {
+      "name": "fork-memory-indirect-call",
+      "policy": "fork",
+      "hex": "ff10",
+      "expected": {
+        "edits": 1,
+        "segments": ["GS"],
+        "length_delta": 1
+      }
+    },
+    {
+      "name": "fork-memory-indirect-jump",
+      "policy": "fork",
+      "hex": "ff27",
+      "expected": {
+        "edits": 1,
+        "segments": ["GS"],
+        "length_delta": 1
+      }
+    },
+    {
+      "name": "fork-rsp-indirect-call",
+      "policy": "fork",
+      "hex": "ff1424",
+      "expected": {
+        "edits": 0,
+        "segments": ["NONE"],
+        "length_delta": 0
+      }
+    },
+    {
+      "name": "fork-push-memory",
+      "policy": "fork",
+      "hex": "ff30",
+      "expected": {
+        "edits": 1,
+        "segments": ["GS"],
+        "length_delta": 1
+      }
+    },
+    {
+      "name": "fork-pop-memory",
+      "policy": "fork",
+      "hex": "8f00",
+      "expected": {
+        "edits": 1,
+        "segments": ["GS"],
+        "length_delta": 1
+      }
+    },
+    {
+      "name": "fork-absolute-memory",
+      "policy": "fork",
+      "hex": "48a10010000000000000c3",
+      "expected": {
+        "edits": 1,
+        "segments": ["GS", "NONE"],
+        "length_delta": 1
+      }
+    },
+    {
+      "name": "fork-direct-call-retarget-preserved",
+      "policy": "fork",
+      "hex": "e8fb0f0000c3",
+      "expected": {
+        "edits": 0,
+        "segments": ["NONE", "NONE"],
+        "length_delta": 0,
+        "branch_targets": {
+          "0": "0x2000"
+        }
+      }
+    },
+    {
+      "name": "fork-native-implicit-stack",
+      "policy": "fork",
+      "hex": "5058e800000000c3",
+      "expected": {
+        "edits": 0,
+        "segments": ["NONE", "NONE", "NONE", "NONE"],
+        "length_delta": 0
+      }
+    },
+    {
+      "name": "fork-reject-string-memory",
+      "policy": "fork",
+      "hex": "f3a4c3",
+      "error": "multiple explicit memory operands"
+    },
+    {
+      "name": "fork-reject-leave-rbp",
+      "policy": "fork",
+      "hex": "c9c3",
+      "error": "implicit non-RSP memory"
+    },
+    {
+      "name": "fork-reject-existing-fs",
+      "policy": "fork",
+      "hex": "64488b07c3",
+      "error": "already has a segment override"
+    }
+  ]
+}
