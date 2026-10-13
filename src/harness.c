@@ -14,6 +14,9 @@
 #include <time.h>
 #include <unistd.h>
 
+/* FS-relative TLS slots used by the REP MOVSB wrapper. Keep per host thread. */
+__thread uintptr_t rep_sandbox_offset;
+__thread uint64_t rep_scratch_rax;
 static void die(const char *s) { perror(s); exit(1); }
 static uint64_t ns(clockid_t c) {
     struct timespec t;
@@ -62,7 +65,7 @@ static void perf_command(const char *command) {
 }
 int main(int argc, char **argv) {
     if (argc != 6 && argc != 8) {
-        fprintf(stderr, "usage: %s sum|update|avx2|chase native|zero|shift|direct bytes rounds cpu [--mapping copy|alias]\n", argv[0]);
+        fprintf(stderr, "usage: %s sum|update|avx2|chase|rep_movsb native|zero|shift|direct bytes rounds cpu [--mapping copy|alias]\n", argv[0]);
         return 2;
     }
     int alias = 0;
@@ -75,9 +78,10 @@ int main(int argc, char **argv) {
     int cpu = atoi(argv[5]);
     int shifted = !strcmp(mode, "shift"), direct = !strcmp(mode,"direct");
     int child_selected = shifted || direct, chase = !strcmp(kernel, "chase");
+    int rep = !strcmp(kernel, "rep_movsb");
     int mutating = !strcmp(kernel, "update") || !strcmp(kernel, "avx2");
     if ((strcmp(mode,"native") && strcmp(mode,"zero") && !shifted && !direct) ||
-        (!chase && !mutating && strcmp(kernel,"sum")) || bytes < 4096 ||
+        (!chase && !mutating && !rep && strcmp(kernel,"sum")) || bytes < 4096 ||
         bytes > (1ULL<<28) || bytes % 4096 || !rounds || cpu < 0 || cpu >= CPU_SETSIZE) return 2;
     if (!strcmp(kernel,"avx2") && !__builtin_cpu_supports("avx2")) {
         fprintf(stderr, "AVX2 not supported\n"); return 77;
@@ -128,6 +132,7 @@ int main(int argc, char **argv) {
     unsigned long saved_gs;
     if (syscall(SYS_arch_prctl, ARCH_GET_GS, &saved_gs)) die("ARCH_GET_GS");
     set_gs(shifted ? delta : 0);
+    rep_sandbox_offset = shifted ? delta : 0;
     // A missed prefix in shifted code faults instead of silently reading parent data.
     if (child_selected && mprotect(parent, bytes, PROT_NONE)) die("mprotect");
     perf_init();
@@ -135,6 +140,9 @@ int main(int argc, char **argv) {
     uint64_t (*fn)(uint64_t *, size_t, size_t) = kernel_sum;
     if (!strcmp(kernel,"update")) fn=kernel_update;
     if (!strcmp(kernel,"avx2")) fn=kernel_avx2;
+    if (rep) fn = (getenv("GSFORK_REP_WRAPPED") &&
+                   !strcmp(getenv("GSFORK_REP_WRAPPED"), "1"))
+                      ? kernel_rep_movsb_wrapped : kernel_rep_movsb_native;
     for (int i=0; i<3; ++i) {
         if (chase) (void)kernel_chase(argument,n,1); else (void)fn(argument,n,1);
     }
@@ -148,9 +156,18 @@ int main(int argc, char **argv) {
     int cpu_after = sched_getcpu();
     set_gs(saved_gs);
     if (child_selected && mprotect(parent, bytes, PROT_READ|PROT_WRITE)) die("restore parent");
-    uint64_t expected = mutating ? n+rounds+3 : initial_sum*rounds;
+    uint64_t expected = rep ? n/2 : (mutating ? n+rounds+3 : initial_sum*rounds);
     int ok = result == expected && cpu_before == cpu && cpu_after == cpu;
-    if (mutating) {
+    if (rep) {
+        const uint64_t *p = parent, *c = child;
+        for (size_t i=0; i<n; ++i) {
+            uint64_t original = i+1;
+            uint64_t copied = i < n/2 ? original : i-n/2+1;
+            uint64_t want_p = (!child_selected || alias) ? copied : original;
+            uint64_t want_c = (child_selected || alias) ? copied : original;
+            if (p[i] != want_p || c[i] != want_c) { ok=0; break; }
+        }
+    } else if (mutating) {
         const uint64_t *p = parent, *c = child;
         for (size_t i=0; i<n; ++i) {
             uint64_t want_p = i+1+((alias || !child_selected) ? rounds+3 : 0);

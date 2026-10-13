@@ -19,7 +19,10 @@ VARIANTS={'original':('original','native'),'reencoded':('reencoded','native'),
 
 def run(variant,kernel,size,rounds,cpu):
     binary,mode=VARIANTS[variant]
-    p=subprocess.run([str(ROOT/'build'/binary),kernel,mode,str(size),str(rounds),str(cpu)],capture_output=True,text=True,check=True,timeout=60)
+    env=os.environ.copy()
+    if kernel=='rep_movsb':
+        env['GSFORK_REP_WRAPPED']='1' if variant in ('gs_zero','gs_shift') else '0'
+    p=subprocess.run([str(ROOT/'build'/binary),kernel,mode,str(size),str(rounds),str(cpu)],capture_output=True,text=True,check=True,timeout=60,env=env)
     r=json.loads(p.stdout)
     if not r['verified']: raise RuntimeError(r)
     return dict(variant=variant,**r)
@@ -54,7 +57,7 @@ def main():
          'perf_available':shutil.which('perf') is not None,'hardware_counters_collected':False,'random_seed':20261006,
          'binary_sha256':{b:hashlib.sha256((ROOT/'build'/b).read_bytes()).hexdigest() for b in ('original','reencoded','rewritten')}}
     (a.output/'environment.json').write_text(json.dumps(env,indent=2)+'\n')
-    cases=[(k,s) for k in ('sum','update','avx2','chase') for s in (32768,8*1024*1024)]
+    cases=[(k,s) for k in ('sum','update','avx2','chase','rep_movsb') for s in (32768,8*1024*1024)]
     raw=[]; summary=[]
     with (a.output/'samples.jsonl').open('w') as log:
         for kernel,size in cases:
@@ -84,7 +87,7 @@ def main():
                     'median_thread_ns':stats.median(pair[variant]['thread_ns'] for pair in paired),
                     'wall_ratio':stats.median(ratios),'wall_ratio_ci95':ci_median(ratios,rng),
                     'thread_ratio':stats.median(cpu_ratios),
-                    'median_ns_per_element':stats.median(values)/(rounds*size/(16 if kernel=='chase' else 8))}
+                    'median_ns_per_element':stats.median(values)/(rounds*size/(2 if kernel=='rep_movsb' else (16 if kernel=='chase' else 8)))}
             summary.append(item)
             (a.output/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
             print(f"{kernel:8s} {size//1024:5d} KiB: zero {item['variants']['gs_zero']['wall_ratio']:.4f}x, shift {item['variants']['gs_shift']['wall_ratio']:.4f}x, control {item['variants']['reencoded']['wall_ratio']:.4f}x",flush=True)
@@ -92,7 +95,7 @@ def main():
         writer=csv.DictWriter(f,fieldnames=list(raw[0])); writer.writeheader(); writer.writerows(raw)
     env['cgroup_cpu_stat_after']=read('/sys/fs/cgroup/cpu.stat')
     (a.output/'environment.json').write_text(json.dumps(env,indent=2)+'\n')
-    rows=['| Kernel | Data | Original ns/element | GS=0 overhead | GS=1 TiB overhead (95% CI) | Re-encode control |',
+    rows=['| Kernel | Data | Original ns/element (REP: ns/byte copied) | GS=0 overhead | GS=1 TiB overhead (95% CI) | Re-encode control |',
           '|---|---:|---:|---:|---:|---:|']
     for s in summary:
         v=s['variants']; lo,hi=v['gs_shift']['wall_ratio_ci95']

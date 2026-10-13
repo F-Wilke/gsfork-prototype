@@ -41,3 +41,22 @@ K(chase) uint64_t kernel_chase(struct node *p, size_t steps, size_t rounds) {
         }
     return sum;
 }
+
+/* Copy the lower half into the upper half, repeating enough times to
+ * benchmark the REP engine rather than a single function call. Both variants
+ * have identical copy volume and output; only the copy primitive differs.
+ * This is a hand-written equivalent of the intended binary rewrite. */
+extern void rep_movsb_copy_native(void *, const void *, size_t);
+extern void rep_movsb_copy_wrapped(void *, const void *, size_t);
+extern __thread uintptr_t rep_sandbox_offset;
+#define REP_COPY_KERNEL(name, offset) \
+__attribute__((noinline, noclone)) \
+uint64_t kernel_rep_movsb_##name(uint64_t *p, size_t n, size_t rounds) { \
+    for (size_t r = 0; r < rounds; ++r) { \
+        rep_movsb_copy_##name(p + n/2, p, (n/2)*sizeof(*p)); \
+        __asm__ volatile("" ::: "memory"); \
+    } \
+    return *(uint64_t *)((uintptr_t)&p[n-1] + (offset)); \
+}
+REP_COPY_KERNEL(native, 0)
+REP_COPY_KERNEL(wrapped, rep_sandbox_offset)
