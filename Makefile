@@ -14,8 +14,10 @@ build/kernels.o: src/kernels.c src/kernels.h | build
 	$(CC) $(CFLAGS) $(KFLAGS) -c $< -o $@
 build/harness.o: src/harness.c src/kernels.h | build
 	$(CC) $(CFLAGS) -c $< -o $@
-build/original: build/kernels.o build/harness.o slots.ld
-	$(CC) -no-pie -Wl,--build-id=none -Wl,-T,slots.ld build/kernels.o build/harness.o -o $@
+build/rep_movsb.o: src/rep_movsb.S | build
+	$(CC) -c $< -o $@
+build/original: build/kernels.o build/harness.o build/rep_movsb.o slots.ld
+	$(CC) -no-pie -Wl,--build-id=none -Wl,-T,slots.ld build/kernels.o build/harness.o build/rep_movsb.o -o $@
 build/rewritten: build/original rewrite.py
 	$(PYTHON) rewrite.py $< $@ --report build/rewrite.json
 build/reencoded: build/original rewrite.py
