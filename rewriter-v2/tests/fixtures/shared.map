@@ -1,0 +1,4 @@
+GS_1.0 {
+    global: gs_shared;
+    local: *;
+};

@@ -1,0 +1,4 @@
+GS_IFUNC_1.0 {
+    global: exported_ifunc; call_ifunc; ifunc_pointer; exercise_resolver;
+    local: *;
+};

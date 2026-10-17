@@ -1,0 +1,7 @@
+VERS_1 {
+    global: version_api;
+};
+VERS_2 {
+    global: version_api; call_versions;
+    local: *;
+} VERS_1;

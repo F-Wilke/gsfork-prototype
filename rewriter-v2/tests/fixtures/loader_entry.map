@@ -1,0 +1,3 @@
+HEADER_TEST {
+    global: _start; unused_fsbase;
+};

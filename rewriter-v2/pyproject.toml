@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gsfork-elf"
+version = "0.1.0"
+description = "Fail-closed GS-Fork rewriting of linked x86-64 ELF artifacts"
+requires-python = ">=3.10"
+dependencies = [
+    "ddisasm==1.9.5",
+    "gtirb==2.3.2",
+    "gtirb-rewriting==0.4.1",
+    "gtirb-pprinter==2.2.5",
+    "iced-x86==1.21.0",
+    "pyelftools==0.32",
+]
+
+[project.scripts]
+gsfork-elf = "gsfork_elf.cli:main"
+gsfork-cc = "gsfork_elf.compiler:main"
+
+[tool.setuptools.packages.find]
+include = ["gsfork_elf*"]
