@@ -2,6 +2,8 @@ PYTHON ?= .venv/bin/python
 GLIBC_BUILD ?= ../../glibc-2.35/build
 REWRITTEN_LD ?= build/glibc/ld.gs
 REWRITTEN_LIBC ?= build/glibc/libc.gs
+CXX_RUNTIME=build/glibc/cxx-runtime
+
 
 .PHONY: install test check glibc-check
 install:
