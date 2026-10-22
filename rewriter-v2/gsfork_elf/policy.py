@@ -46,11 +46,51 @@ vpandn vpsubb vpcmpistri vpslldq vpalignr vpsrldq vpbroadcastd
 vpminud vpcmpd vptestmd kunpckbw vmovaps vpcmpeqd vpternlogd vmovdqu32
 vmovntdq vmovups vpshufb vbroadcastss vmovdqu8 vpcmpub vpcmpeqq
 fld fstp fldz fcomip fchs fnstenv fldenv fnstcw fucomi fabs fxch
-fucomip fxam fnstsw fild fsubp fcomi fdiv fsubrp fld1 fmulp fscale
-fmul fadd fldcw faddp fcmovbe fdivp wait
+fucomip fxam fnstsw fild fsubp fcomi fdiv fdivr fsubrp fld1 fmulp fscale
+fmul fadd fldcw faddp fcmovbe fdivp fdivrp wait
 fxsave fxrstor xsave xsavec xrstor xgetbv rdtsc rdtscp
 xbegin xabort xend xtest
 """.split())
+#X87 floating-point instructions for libm
+ORDINARY |= set("""
+    fist fistp fisttp fst ffree ffreep
+    fadd faddp fiadd
+    fsub fsubp fsubr fsubrp fisub fisubr
+    fmul fmulp fimul
+    fdiv fdivp fdivr fdivrp fidiv fidivr
+    fcom fcomp fcompp ficom ficomp
+    fucom fucomp fucompp
+    fcmovb fcmove fcmovbe fcmovu
+    fcmovnb fcmovne fcmovnbe fcmovnu
+    fxtract f2xm1 fyl2x fyl2xp1
+    fsin fcos fsincos fptan fpatan
+    fprem fprem1 fsqrt frndint fscale
+    ftst fxam fabs fchs
+    fld1 fldz fldpi fldl2e fldl2t fldlg2 fldln2
+    fdecstp fincstp fnop
+    fnclex fclex fninit finit
+    fnstcw fldcw fnstsw fstsw
+    fnstenv fstenv fldenv
+    fbld fbstp
+""".split())
+# AVX and SSE floating-point instructions for libm
+ORDINARY |= set("""
+vmovsd vmulsd vaddsd vsubsd
+vfmaddsd vfmadd213sd vfmadd132sd vfmadd231sd
+vmovapd vandpd vcomisd vxorpd vdivsd
+vfnmaddsd vfnmadd132sd vfnmadd213sd vfnmadd231sd
+vcmpsd vblendvpd vcvttsd2si
+vstmxcsr vldmxcsr
+cmpss vcvtsd2ss vmovss vxorps vucomisd
+vcvtsi2sd vfmsub132sd vfmsubsd vandnpd
+vcvtss2sd roundsd roundss vcomiss
+vunpcklpd vmulpd vfmadd132pd
+vaddss vmulss vmovddup vfmadd213pd
+vcvtpd2ps vextractps vsubss vucomiss
+vfmadd213ss vfmaddss vdivss
+vorpd
+""".split())
+
 RUNTIME_CONTROL = {"rdfsbase", "wrfsbase", "syscall", "rdpkru", "wrpkru",
                    "rdsspq", "incsspq", "rstorssp", "saveprevssp"}
 BRANCHES = {"j" + suffix for suffix in
