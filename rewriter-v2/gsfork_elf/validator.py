@@ -68,10 +68,24 @@ def value(image, expr):
     return result + expr["offset"]
 
 
-def check_reference(image, ins, expr, plt_entries):
-    if expr is None:
-        return
-    attributes = expr["attributes"]
+def signed(value):
+    value &= (1 << 64) - 1
+    return value - (1 << 64) if value >> 63 else value
+
+
+def tls_bias(image, ins, expr):
+    """Thread-pointer bias of a local-exec reference: encoded value minus module offset."""
+    if not expr["tls"]:
+        raise RewriteError(f"local-exec TPOFF reference to non-TLS symbol {expr['symbol']}")
+    if not image.executable_tls:
+        raise RewriteError(f"{image.path}: local-exec TPOFF reference in a shared object")
+    if ins.is_ip_rel_memory_operand:
+        raise RewriteError("local-exec TPOFF reference cannot be RIP-relative")
+    return signed(encoded_target(ins, expr)) - (image.symbol(expr.get("value_symbol", expr["symbol"]))
+                                                 + expr["offset"])
+
+
+def encoded_target(ins, expr):
     if expr["field"] == "displacement":
         target = ins.ip_rel_memory_address if ins.is_ip_rel_memory_operand else ins.memory_displacement
     elif ins.is_ip_rel_memory_operand:
@@ -87,6 +101,18 @@ def check_reference(image, ins, expr, plt_entries):
             target = ins.memory_displacement
         else:
             raise RewriteError(f"unhandled symbolic instruction form: {ins}")
+    return target
+
+
+def check_reference(image, ins, expr, plt_entries):
+    if expr is None:
+        return
+    attributes = expr["attributes"]
+    target = encoded_target(ins, expr)
+    if attributes == ["TPOFF"]:
+        if "tls_bias" not in expr or tls_bias(image, ins, expr) != expr["tls_bias"]:
+            raise RewriteError(f"local-exec TLS reference to {expr['symbol']} changed its thread-pointer offset")
+        return
     if attributes == ["PLT"]:
         expected = plt_entries.get(target)
         resolver_match = (expr.get("ifunc_resolver") is not None

@@ -21,6 +21,7 @@ from .metadata import Metadata
 from .plt import PLT_SECTIONS, patch_plt, pointer_identity
 from .policy import Runtime, classify, decode
 from .recovery import repair_masked_table_bases
+from .validator import tls_bias
 from .symbols import (add_reference_aliases, preserve_resolved_fs_offsets, resolver_symbols, restore_linker_symbols,
                       uniquify_locals, verify_tls)
 
@@ -61,6 +62,7 @@ def run(command, log, *, allow_absent_entry=False, repair_header_symbol=False, l
         diagnostics = diagnostics.replace("WARNING: Failed to set module entry point.", "")
     if repair_header_symbol:
         diagnostics = diagnostics.replace("WARNING: Moving symbol to first block of section: __ehdr_start", "")
+    diagnostics = diagnostics.replace("WARNING: Moving symbol to first block of section: __bss_start", "INFO: Moving symbol to first block of section: __bss_start")
     for name in set(local_ifunc_names) | set(local_tls_names):
         diagnostic = "WARNING: Could not find GLOBAL/WEAK symbol for "
         diagnostics = diagnostics.replace(f"{diagnostic}\n{diagnostic}{name}\n", "")
@@ -129,6 +131,7 @@ class Transform(Pass):
         self.blocks, self.data, self.retired = [], [], []
         self.input_data_ids = set()
         self.resolvers = resolvers or {}
+        self.tls_bias = None
         _, self.plt_slots = patch_plt(image, require_now=False)
 
     def begin_module(self, module, functions, context):
@@ -203,9 +206,20 @@ class Transform(Pass):
                         for n in range(ins.op_count))
                     if relative and not exprs:
                         fail(self.image.path, section.name, ins.ip, "unrecovered layout-dependent symbolic reference")
-                    if any(e["attributes"] not in ([], ["PLT"], ["GOT", "PCREL"], ["GOT", "TPOFF"])
+                    if any(e["attributes"] not in ([], ["PLT"], ["GOT", "PCREL"], ["GOT", "TPOFF"], ["TPOFF"])
                            for e in exprs):
-                        fail(self.image.path, section.name, ins.ip, "unsupported symbolic instruction attributes")
+                        fail(self.image.path, section.name, ins.ip, f"unsupported symbolic instruction attributes {[e['attributes'] for e in exprs]}")
+                    if exprs and exprs[0]["attributes"] == ["TPOFF"]:
+                        # Local-exec TLS: the linker recomputes sym@TPOFF. Record the
+                        # thread-pointer bias so the output is checked for the same offset.
+                        try:
+                            bias = tls_bias(self.image, ins, exprs[0])
+                        except RewriteError as error:
+                            fail(self.image.path, section.name, ins.ip, str(error))
+                        if self.tls_bias is not None and bias != self.tls_bias:
+                            fail(self.image.path, section.name, ins.ip,
+                                 "local-exec TLS references disagree on the thread-pointer bias")
+                        self.tls_bias = exprs[0]["tls_bias"] = bias
                     item = {"original": ins.ip, "bytes": bytes(block.contents)[
                         ins.ip - block.address:ins.next_ip - block.address].hex(),
                         "rule": rule, "expression": exprs[0] if exprs else None,
@@ -315,6 +329,12 @@ def print_ir(ir_path, binary, assembly, log, library_paths, *, image=None, entry
         command.append(f"--compiler-args=-Wl,-{flag}={name}")
     if image is not None and image.elf.get_section_by_name(".plt.sec") is not None:
         command.append("--compiler-args=-Wl,-z,ibtplt")
+    if image is not None:
+        # Keep strong imports the input's loader contract requires even when no
+        # instruction references them (e.g. a __tls_get_addr PLT stub left behind
+        # by GD->LE TLS relaxation); the linker otherwise drops them silently.
+        for name in image.strong_imports:
+            command.append(f"--compiler-args=-Wl,--undefined={name}")
     for section in (".dynsym", ".dynstr", ".gnu.hash", ".hash",
                     ".gnu.version", ".gnu.version_r", ".gnu.version_d"):
         command.extend(["--skip-section", section])
@@ -339,7 +359,7 @@ def workspace(output):
 
 
 def rewrite(input_path, output_path, *, baseline=False, runtime=Runtime(),
-            trusted_sections=(), trusted_libraries=(), library_paths=()):
+            trusted_sections=(), trusted_libraries=(), library_paths=(), runtime_layout=None):
     from .validator import validate_artifact
 
     runtime.check()
@@ -426,7 +446,8 @@ def rewrite(input_path, output_path, *, baseline=False, runtime=Runtime(),
             "input_entry": image.elf["e_entry"],
             "output_sha256": hashlib.sha256(staged.read_bytes()).hexdigest(),
             "baseline_sha256": hashlib.sha256((work / "baseline").read_bytes()).hexdigest(),
-            "runtime": asdict(runtime), "trusted_sections": sorted(set(trusted_sections)),
+            "runtime": asdict(runtime), "runtime_layout": runtime_layout,
+            "trusted_sections": sorted(set(trusted_sections)),
             "trusted_libraries": sorted(set(trusted_libraries)), "libraries": image.libraries,
             "blocks": transform.blocks, "data": transform.data, "retired_plt": transform.retired,
             "generated": generated, "exception_sites": metadata.sites,
