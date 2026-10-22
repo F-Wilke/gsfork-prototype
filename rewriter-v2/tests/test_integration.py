@@ -135,6 +135,51 @@ class IntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(RewriteError, "TLS layout"):
             validate_artifact(tampered, report)
 
+    def test_local_exec_tls_executables(self):
+        variants = {
+            "pie": ["-fPIE", "-pie"],
+            # lind-style: -fPIC GD accesses relaxed to local-exec by ld, with the
+            # loader linked explicitly so an unused __tls_get_addr import remains.
+            "relaxed": ["-fPIC", "-pie", "-Wl,--no-as-needed", "-l:ld-linux-x86-64.so.2"],
+        }
+        for name, flags in variants.items():
+            with self.subTest(variant=name):
+                source, output = self.work / f"le-{name}", self.work / f"le-{name}.gs"
+                command(["gcc", "-O0", "-g", FIXTURES / "local_exec_tls.c", "-pthread", "-Wl,-z,now",
+                         *flags, "-o", source])
+                image = Image(source)
+                trust = TRUST + tuple(lib for lib in image.libraries if lib.startswith("ld-linux"))
+                if name == "relaxed":
+                    self.assertIn("__tls_get_addr", image.strong_imports)
+                report = rewrite(source, output, trusted_libraries=trust)
+                references = [i for b in report["blocks"] for i in b.get("instructions", [])
+                              if i["expression"] and i["expression"]["attributes"] == ["TPOFF"]]
+                if name == "pie":
+                    # Direct %fs:sym@tpoff accesses keep their linked, layout-checked offsets.
+                    self.assertGreaterEqual(len(report["resolved_fs_offsets"]), 3)
+                else:
+                    self.assertGreaterEqual(len(references), 3)
+                    self.assertEqual(len({i["expression"]["tls_bias"] for i in references}), 1)
+                for binary in (source, Path(str(output) + ".gsfork") / "baseline", output):
+                    self.assertEqual(command([binary]).stdout, "local-exec-tls-ok\n")
+                rewritten = Image(output)
+                self.assertTrue(set(map(tuple, report["input_dynamic_symbols"]))
+                                <= set(rewritten.dynamic_symbols))
+                if not references:
+                    continue
+                # Shift one relinked sym@TPOFF displacement: validation must reject it.
+                location = next(loc for loc in report["locations"] if loc["original"] == references[0]["original"])
+                decoder = Decoder(64, rewritten.read(location["address"],
+                                                     location["end"] - location["address"]),
+                                  ip=location["address"])
+                ins = decoder.decode()
+                field = location["address"] + decoder.get_constant_offsets(ins).displacement_offset
+                old = int.from_bytes(rewritten.read(field, 4), "little", signed=True)
+                tampered, bad = self.mutate(field, (old - 8).to_bytes(4, "little", signed=True),
+                                            source=output, provenance=report)
+                with self.assertRaisesRegex(RewriteError, "thread-pointer offset"):
+                    validate_artifact(tampered, bad)
+
     def test_duplicate_local_symbol_identity(self):
         source, rewritten = self.work / "duplicate", self.work / "duplicate.gs"
         command(["gcc", "-O0", FIXTURES / "duplicate_a.c", FIXTURES / "duplicate_b.c",
