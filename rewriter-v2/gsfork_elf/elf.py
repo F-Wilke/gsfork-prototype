@@ -57,6 +57,7 @@ class Image:
         self.local_tls_names = set()
         self.tls_symbols = {}
         self.dynamic_symbols = []
+        self.strong_imports = []
         self.function_ranges = []
         self.symbol_versions = []
         self.dynamic_versions = {}
@@ -86,6 +87,8 @@ class Image:
                         self.symbol_addresses[symbol.name].add(symbol["st_value"])
                     if section.name == ".dynsym" and symbol.name:
                         self.dynamic_symbols.append((symbol.name, symbol["st_info"]["type"]))
+                        if symbol["st_shndx"] == "SHN_UNDEF" and symbol["st_info"]["bind"] == "STB_GLOBAL":
+                            self.strong_imports.append(symbol.name)
                         ndx = versym.get_symbol(index)["ndx"] if versym else "VER_NDX_GLOBAL"
                         version = versions.get(ndx & 0x7FFF, "") if isinstance(ndx, int) else ""
                         hidden = bool(ndx & 0x8000) if isinstance(ndx, int) else False
@@ -155,6 +158,12 @@ class Image:
         self.now = any(t.entry.d_tag == "DT_BIND_NOW"
                        or (t.entry.d_tag == "DT_FLAGS" and t.entry.d_val & 8)
                        or (t.entry.d_tag == "DT_FLAGS_1" and t.entry.d_val & 1) for t in tags)
+        # Local-exec TLS is only valid in the executable, whose TLS block sits at a
+        # static thread-pointer offset; shared objects must use the GOT/TLSDESC.
+        self.executable_tls = (self.elf["e_type"] == "ET_EXEC"
+                               or any(t.entry.d_tag == "DT_FLAGS_1" and t.entry.d_val & 0x08000000
+                                      for t in tags)
+                               or any(s["p_type"] == "PT_INTERP" for s in self.elf.iter_segments()))
         if any(t.entry.d_tag in ("DT_TEXTREL", "DT_RELR", "DT_AUDIT", "DT_DEPAUDIT")
                for t in tags):
             raise RewriteError(f"{path}: unsupported dynamic relocation/audit feature")
@@ -191,3 +200,33 @@ class Image:
                 if self.symbols.get(name) == value:
                     return name
         return value
+
+
+def tcb_field_offset(path, struct, field):
+    """Resolve offsetof(struct, field) from an ELF's DWARF debug info.
+
+    On x86-64 the thread pointer (and thus FS base) is the address of the TCB,
+    which is `struct pthread` itself, so a member's FS-relative displacement is
+    exactly its struct offset. Letting the compiler-generated DWARF supply the
+    offset keeps the runtime slots free of hand-written magic numbers.
+    """
+    elf = ELFFile(io.BytesIO(Path(path).read_bytes()))
+    if not elf.has_dwarf_info():
+        raise RewriteError(f"{path}: no DWARF debug info to resolve struct {struct} offsets")
+    want = struct.encode()
+    member = field.encode()
+    for unit in elf.get_dwarf_info().iter_CUs():
+        for die in unit.iter_DIEs():
+            if (die.tag != "DW_TAG_structure_type"
+                    or die.attributes.get("DW_AT_name") is None
+                    or die.attributes["DW_AT_name"].value != want):
+                continue
+            for child in die.iter_children():
+                if child.tag != "DW_TAG_member" or child.attributes.get("DW_AT_name") is None:
+                    continue
+                if child.attributes["DW_AT_name"].value == member:
+                    location = child.attributes.get("DW_AT_data_member_location")
+                    if location is None or not isinstance(location.value, int):
+                        raise RewriteError(f"{path}: {struct}.{field} has no constant offset")
+                    return location.value
+    raise RewriteError(f"{path}: struct {struct} member {field} not found in DWARF")
