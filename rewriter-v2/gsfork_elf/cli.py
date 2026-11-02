@@ -22,9 +22,10 @@ def runtime_slots(args):
     program will run with) or, by default, from the input itself, which only works
     when the input is that glibc. Returns the slots and the layout provenance.
     """
-    fields = (args.scratch_field, args.sandbox_field)
-    if args.tcb_layout is not None and fields == (None, None):
-        raise RewriteError("--tcb-layout is only meaningful with --scratch-field/--sandbox-field")
+    fields = (args.scratch_field, args.sandbox_field, args.parent_stack_field)
+    if args.tcb_layout is not None and not any(fields):
+        raise RewriteError("--tcb-layout is only meaningful with "
+                           "--scratch-field/--sandbox-field/--parent-stack-field")
     source = Path(args.tcb_layout if args.tcb_layout is not None else args.input).resolve()
 
     def slot(number, field, numeric_flag, name):
@@ -41,12 +42,14 @@ def runtime_slots(args):
         return number
 
     runtime = Runtime(slot(args.scratch_rax, args.scratch_field, "scratch-rax", "scratch"),
-                      slot(args.sandbox_offset, args.sandbox_field, "sandbox-offset", "sandbox"))
+                      slot(args.sandbox_offset, args.sandbox_field, "sandbox-offset", "sandbox"),
+                      slot(args.parent_stack_offset, args.parent_stack_field,
+                           "parent-stack-offset", "parent-stack"))
     layout = None
-    if fields != (None, None):
+    if any(fields):
         layout = {"source": str(source), "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
                   "struct": "pthread", "scratch_field": args.scratch_field,
-                  "sandbox_field": args.sandbox_field}
+                  "sandbox_field": args.sandbox_field, "parent_stack_field": args.parent_stack_field}
     return runtime, layout
 
 
@@ -59,10 +62,14 @@ def parser():
         command.add_argument("output", type=Path)
         command.add_argument("--scratch-rax", type=lambda s: int(s, 0))
         command.add_argument("--sandbox-offset", type=lambda s: int(s, 0))
+        command.add_argument("--parent-stack-offset", type=lambda s: int(s, 0),
+                             help="FS slot holding the signed RBP-to-parent-stack delta; enables leave rewriting")
         command.add_argument("--scratch-field",
                              help="struct pthread member holding FS scratch; offset read from input DWARF")
         command.add_argument("--sandbox-field",
                              help="struct pthread member holding the sandbox delta; offset read from input DWARF")
+        command.add_argument("--parent-stack-field",
+                             help="struct pthread member holding the parent stack delta; enables leave rewriting")
         command.add_argument("--tcb-layout", type=Path,
                              help="ELF with DWARF for struct pthread (the glibc ld.so/libc.so the program "
                                   "runs with); defaults to the input, which only suits glibc itself")

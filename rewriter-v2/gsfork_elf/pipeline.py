@@ -22,7 +22,8 @@ from .plt import PLT_SECTIONS, patch_plt, pointer_identity
 from .policy import Runtime, classify, decode
 from .recovery import repair_masked_table_bases
 from .validator import tls_bias
-from .symbols import (add_reference_aliases, preserve_resolved_fs_offsets, resolver_symbols, restore_linker_symbols,
+from .symbols import (add_reference_aliases, preserve_integral_symbols, preserve_resolved_fs_offsets,
+                      resolver_symbols, restore_linker_symbols,
                       uniquify_locals, verify_tls)
 
 
@@ -234,6 +235,37 @@ class Transform(Pass):
                         # Inserting it preserves the original symbolic operand and CFI.
                         context.insert_at(block, ins.ip - block.address,
                                           Patch.from_function(lambda _: "gs", Constraints()))
+                    elif rule == "leave":
+                        unwind = item["unwind"]
+                        if unwind and (unwind["cfa"][0] != 6 or unwind["cfa"][2] is not None):
+                            fail(self.image.path, section.name, ins.ip,
+                                 "leave expansion requires RBP-based CFA or absent input unwind")
+                        if unwind and any(kind == "REGISTER" and argument == 0
+                                          or kind in ("EXPRESSION", "VAL_EXPRESSION")
+                                          for kind, argument in unwind["registers"].values()):
+                            fail(self.image.path, section.name, ins.ip,
+                                 "leave expansion needs CFI rules for temporary RAX")
+                        asm = self.runtime.leave()
+                        # Replacing LEAVE removes CFI at the following instruction
+                        # when both share a block. Emit that boundary after POP.
+                        cfi = module.aux_data["cfiDirectives"].data
+                        boundary = gtirb.Offset(block, ins.next_ip - block.address)
+                        if boundary.displacement < block.size:
+                            directives = cfi.get(boundary, [])
+                            for directive, arguments, symbol in directives:
+                                if symbol.int or directive not in {
+                                        ".cfi_def_cfa", ".cfi_def_cfa_register", ".cfi_def_cfa_offset",
+                                        ".cfi_adjust_cfa_offset", ".cfi_offset", ".cfi_rel_offset",
+                                        ".cfi_restore", ".cfi_register", ".cfi_same_value",
+                                        ".cfi_undefined", ".cfi_remember_state", ".cfi_restore_state",
+                                        ".cfi_escape"}:
+                                    fail(self.image.path, section.name, ins.ip,
+                                         "unsupported CFI boundary after leave")
+                                asm += directive + " " + ", ".join(map(str, arguments)) + "\n"
+                            if directives:
+                                del cfi[boundary]
+                        context.replace_at(block, ins.ip - block.address, ins.len,
+                                           Patch.from_function(lambda _, asm=asm: asm, Constraints()))
                     elif rule in ("rep-movsb", "movs", "stos"):
                         unwind = item["unwind"]
                         temporary_registers = {0, 1, 5} if rule == "stos" else {0, 4, 5}
@@ -419,12 +451,13 @@ def rewrite(input_path, output_path, *, baseline=False, runtime=Runtime(),
                  work / "baseline.log", library_paths, image=image, entry_symbol=entry_symbol,
                  initializers=initializers)
         transform = Transform(image, metadata, runtime, trusted_sections, baseline, resolvers)
-        passes = PassManager()
-        passes.add(transform)
-        passes.run(ir)
-        padding_passes = PassManager()
-        padding_passes.add(NormalizePadding(transform))
-        padding_passes.run(ir)
+        with preserve_integral_symbols(module):
+            passes = PassManager()
+            passes.add(transform)
+            passes.run(ir)
+            padding_passes = PassManager()
+            padding_passes.add(NormalizePadding(transform))
+            padding_passes.run(ir)
         rewritten_ir = work / "rewritten.gtirb"
         ir.save_protobuf(rewritten_ir)
         staged = work / "output"

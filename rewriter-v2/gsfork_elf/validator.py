@@ -201,6 +201,22 @@ def check_wrapper(instructions, runtime, original):
             raise RewriteError("unexpected prefix in REP wrapper")
 
 
+def check_leave(instructions, runtime, original):
+    if runtime.parent_stack_offset is None or classify(original, runtime) != "leave":
+        raise RewriteError("leave expansion does not correspond to a supported original leave")
+    # Compare complete operands/prefixes against the dedicated runtime sequence.
+    displacement = runtime.parent_stack_offset & 0xFFFFFFFF
+    scratch = (runtime.scratch_rax & 0xFFFFFFFF).to_bytes(4, "little")
+    expected = decode(bytes.fromhex("6448890425") + scratch
+                      + bytes.fromhex("64488b0425") + displacement.to_bytes(4, "little")
+                      + bytes.fromhex("488d64050064488b0425") + scratch + b"\x5d", 0)
+    if (len(instructions) != 5
+            or any(shape(actual, None) != shape(wanted, None)
+                   or actual.segment_prefix != wanted.segment_prefix
+                   for actual, wanted in zip(instructions, expected))):
+        raise RewriteError("leave expansion changed registers, FS parent-stack slot, or stack operation")
+
+
 def validate_artifact(path, report):
     image = Image(path)
     if report["schema"] != 1 or report["mode"] not in ("baseline", "gs"):
@@ -243,7 +259,7 @@ def validate_artifact(path, report):
                 starts.add(ins.ip)
     final_metadata = Metadata(image)
     old_starts, old_ends = {}, {}
-    final_records, wrappers, direct = [], [], []
+    final_records, wrappers, direct, leave_wrappers = [], [], [], []
     instruction_count = 0
     for block in report["blocks"]:
         begin, end = image.symbol(block["begin"]), image.symbol(block["end"])
@@ -258,7 +274,8 @@ def validate_artifact(path, report):
         cursor = 0
         for item_index, item in enumerate(block["instructions"]):
             is_wrapper = item["rule"] in ("rep-movsb", "movs", "stos") and not baseline
-            count = (13 if item["rule"] == "stos" else 11) if is_wrapper else 1
+            is_leave = item["rule"] == "leave" and not baseline
+            count = (13 if item["rule"] == "stos" else 11) if is_wrapper else 5 if is_leave else 1
             if item["rule"] == "padding":
                 available = 0
                 for candidate in instructions[cursor:]:
@@ -277,7 +294,18 @@ def validate_artifact(path, report):
             ins, last = sequence[0], sequence[-1]
             original = decode(bytes.fromhex(item["bytes"]), item["original"])[0]
             try:
-                if is_wrapper:
+                if is_leave:
+                    if block["trusted"]:
+                        raise RewriteError("leave expansion inside trusted code")
+                    check_leave(sequence, runtime, original)
+                    leave_wrappers.append({
+                        "original": item["original"], "begin": ins.ip, "end": last.next_ip,
+                        "phases": [{"address": instruction.ip, "instruction_index": n,
+                                    "rax_in_scratch": 1 <= n <= 3,
+                                    "rsp_on_parent_stack": n >= 3}
+                                   for n, instruction in enumerate(sequence)],
+                    })
+                elif is_wrapper:
                     check_wrapper(sequence, runtime, original)
                     stos = item["rule"] == "stos"
                     wrappers.append({"original": item["original"], "begin": ins.ip,
@@ -451,6 +479,7 @@ def validate_artifact(path, report):
         raise RewriteError(f"{path}: artifact hash does not match provenance report")
     report["locations"] = final_records
     report["wrappers"] = wrappers
+    report["leave_wrappers"] = leave_wrappers
     report["retired_plt_locations"] = [
         {"original": item["original"], "symbol": item["symbol"],
          "final_entries": [address for address, name in plt_entries.items()

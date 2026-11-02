@@ -111,8 +111,12 @@ INFO = InstructionInfoFactory()
 class Runtime:
     scratch_rax: int | None = None
     sandbox_offset: int | None = None
+    parent_stack_offset: int | None = None
 
     def check(self):
+        if (self.parent_stack_offset is not None
+                and not -(1 << 31) <= self.parent_stack_offset <= (1 << 31) - 8):
+            raise RewriteError("parent-stack-offset must be a signed disp32 slot")
         values = (self.scratch_rax, self.sandbox_offset)
         if values == (None, None):
             return
@@ -120,6 +124,23 @@ class Runtime:
             raise RewriteError("scratch-rax and sandbox-offset must both be signed disp32 slots")
         if abs(self.scratch_rax - self.sandbox_offset) < 8:
             raise RewriteError("FS scratch and sandbox-offset slots must not overlap")
+        if (self.parent_stack_offset is not None
+                and any(abs(self.parent_stack_offset - value) < 8 for value in values)):
+            raise RewriteError("FS parent-stack-offset must not overlap scratch or sandbox-offset slots")
+
+    def leave(self):
+        self.check()
+        if self.parent_stack_offset is None:
+            raise RewriteError("leave instrumentation requires an explicit FS parent-stack-offset slot")
+        if self.scratch_rax is None:
+            raise RewriteError("leave instrumentation requires an explicit FS scratch-rax slot")
+        return f"""
+movq %rax, %fs:{self.scratch_rax}
+movq %fs:{self.parent_stack_offset}, %rax
+leaq (%rbp,%rax), %rsp
+movq %fs:{self.scratch_rax}, %rax
+popq %rbp
+"""
 
     def movsb(self):
         self.check()
@@ -216,6 +237,11 @@ def classify(ins, runtime=Runtime(), *, output=False):
             raise RewriteError("unsupported nonstandard stack form")
         if name == "leave" and ins.code != Code.LEAVEQ:
             raise RewriteError("unsupported leave form")
+        if name == "leave" and runtime.parent_stack_offset is not None:
+            if ins.len != 1:
+                raise RewriteError("unsupported prefixed leave form")
+            runtime.leave()
+            return "leave"
     elif name not in ORDINARY and name not in BRANCHES and name not in RUNTIME_CONTROL:
         raise RewriteError(f"unsupported instruction {name}")
     if ins.flow_control in (FlowControl.INTERRUPT, FlowControl.EXCEPTION):

@@ -84,6 +84,46 @@ class IntegrationTests(unittest.TestCase):
                     self.assertEqual(command([binary]).stdout, command([source]).stdout)
                 self.assertEqual(report["mode"], "gs")
 
+    def test_parent_stack_leave(self):
+        source, output = self.work / "leave.so", self.work / "leave.gs.so"
+        loader = self.work / "leave-loader"
+        command(["gcc", "-shared", "-nostdlib", "-Wl,-z,now", FIXTURES / "leave.S", "-o", source])
+        command(["gcc", "-O2", "-Wall", "-Wextra", "-Werror", FIXTURES / "leave_loader.c",
+                 FIXTURES / "leave_invoke.S", "-ldl", "-o", loader])
+        runtime = Runtime(24, 0, 16)
+        report = rewrite(source, output, runtime=runtime)
+        locations = [loc for loc in report["locations"] if loc["rule"] == "leave"]
+        self.assertEqual(len(locations), 1)
+        for binary in (source, Path(str(output) + ".gsfork") / "baseline", output):
+            self.assertEqual(command([loader, binary, "0"]).stdout, "parent-leave-ok\n")
+        for delta in ("4096", "-4096"):
+            self.assertEqual(command([loader, output, delta]).stdout, "parent-leave-ok\n")
+            self.assertNotEqual(command([loader, source, delta], success=False).returncode, 0)
+        # Neither the numeric slot nor the implicit pop may be changed or GS-prefixed.
+        begin = locations[0]["address"]
+        for address, replacement in ((begin + 5, (8).to_bytes(4, "little")),
+                                     (begin + 14, (8).to_bytes(4, "little")),
+                                     (begin + 28, (8).to_bytes(4, "little")),
+                                     (begin + 32, b"\x58"), (begin + 23, b"\x65")):
+            with self.subTest(address=address):
+                bad, provenance = self.mutate(address, replacement, source=output, provenance=report)
+                with self.assertRaisesRegex(RewriteError, "leave expansion"):
+                    validate_artifact(bad, provenance)
+        trusted = self.work / "leave.trusted.so"
+        self.assertEqual([p["rax_in_scratch"] for p in report["leave_wrappers"][0]["phases"]],
+                         [False, True, True, True, False])
+        self.assertEqual([p["rsp_on_parent_stack"] for p in report["leave_wrappers"][0]["phases"]],
+                         [False, False, False, True, True])
+        trusted_report = rewrite(source, trusted, runtime=runtime,
+                                 trusted_sections=(".text",))
+        self.assertFalse(any(loc["rule"] == "leave" for loc in trusted_report["locations"]))
+        self.assertEqual(command([loader, trusted, "0"]).stdout, "parent-leave-ok\n")
+        unsupported = self.work / "leave-rsp-cfa.so"
+        command(["gcc", "-shared", "-nostdlib", "-Wl,-z,now", "-Wa,--defsym,LEAVE_RSP_CFA=1",
+                 FIXTURES / "leave.S", "-o", unsupported])
+        with self.assertRaisesRegex(RewriteError, "leave expansion requires RBP-based CFA"):
+            rewrite(unsupported, self.work / "leave-rsp-cfa.gs.so", runtime=runtime)
+
     def test_versioned_shared_library_initialization(self):
         source, loader = self.work / "versioned.so", self.work / "loader"
         command(["gcc", "-O2", "-fPIC", "-shared", "-Wl,-soname,libgsfixture.so",

@@ -52,6 +52,109 @@ appropriate thread-local storage through its runtime. The runtime must initializ
 The historical `--scratch-rax` slot holds RAX for MOVS and RDX for STOS.
 No offsets are guessed or reserved automatically in an existing process's TLS.
 
+### Deriving the slots from `struct pthread` (no magic numbers)
+
+When the slots are real members of `struct pthread` — as in the custom glibc,
+which adds `sandbox_offset` and `sandbox_scratch` to the TCB — name the fields
+instead of hand-writing displacements:
+
+```sh
+.venv/bin/gsfork-elf rewrite ../../glibc-2.35/build/libc.so.6 libc.gs \
+    --scratch-field sandbox_scratch --sandbox-field sandbox_offset \
+    --trust-library ld-linux-x86-64.so.2 -L ../../glibc-2.35/build/elf
+```
+
+On x86-64 the thread pointer (and therefore the FS base) is the address of the
+TCB, which *is* `struct pthread`, so a member's FS displacement equals its struct
+offset. The rewriter reads that offset straight from the input's DWARF
+(`offsetof(struct pthread, field)`), so the invocation carries no numeric slot at
+all. For the supplied build this resolves to `%fs:0x9c0`/`%fs:0x9c8` (2496/2504).
+
+This is the same idea as letting the assembler place the offset: the only place a
+struct layout becomes a number is the compiler-generated DWARF (equivalently
+glibc's own `gen-as-const`/`tcb-offsets.sym`), and the rewriter consumes that
+number by field name rather than repeating it. The emitted wrapper assembly could
+in principle reference an absolute `.set` symbol so the final assembler encodes the
+displacement, but `gtirb-rewriting` assembles every patch against one shared symbol
+table and rejects the repeated definition; deriving the constant once from DWARF
+achieves the same "no hand-written offsets" result without that limitation.
+`--scratch-field`/`--sandbox-field` and the numeric `--scratch-rax`/
+`--sandbox-offset` are mutually exclusive per slot.
+
+**Rewriting programs and other libraries.** The fields are looked up in the
+DWARF of the input only by default, which works when rewriting glibc itself. An
+ordinary program or third-party library does not contain `struct pthread`, so name
+the glibc that owns the TCB layout explicitly:
+
+```sh
+.venv/bin/gsfork-elf rewrite program program.gs \
+    --scratch-field sandbox_scratch --sandbox-field sandbox_offset \
+    --tcb-layout ../../glibc-2.35/build/libc.so --trust-library libc.so.6
+```
+
+This is deliberately not inferred from `DT_NEEDED libc.so.6`: the loader chooses
+the actual file at run time (`--library-path`, `RUNPATH`, `LD_LIBRARY_PATH`, the
+cache), so the rewriter would have to guess and might read the host glibc, whose
+`struct pthread` has no sandbox fields. The layout source needs DWARF; either the
+unstripped `libc.so`/`ld.so` from the build directory works. The report records
+the source path, its SHA-256, and the field names under `runtime_layout`, so a
+program can be checked against the glibc it is deployed with. Every artifact in one
+process must be rewritten against the same layout; changing `struct pthread`
+requires rewriting them all again.
+
+### Parent-stack `leave` mode
+
+For a runtime that keeps a parent-frame RBP but needs to resume on a relocated
+stack, enable the dedicated rule with the new `struct pthread` member:
+
+```sh
+.venv/bin/gsfork-elf rewrite program program.gs \
+    --parent-stack-field parent_stack_offset \
+    --scratch-field sandbox_scratch --sandbox-field sandbox_offset \
+    --tcb-layout ../../glibc-2.35/build/libc.so \
+    --trust-library libc.so.6
+```
+
+The expansion requires the existing scratch slot (and its paired sandbox-slot
+configuration), shared with MOVS/STOS instrumentation. When rewriting glibc itself,
+the layout defaults to the input, as for the other fields. Alternatively,
+`--parent-stack-offset NUMBER` specifies the FS displacement numerically; it is
+mutually exclusive with `--parent-stack-field`. The slot must be eight bytes,
+signed-disp32-addressable, and must not overlap either other configured slot.
+
+With the slot configured, every untrusted ordinary 64-bit `leave` becomes:
+
+```asm
+movq %rax, %fs:SCRATCH_RAX_FIELD_OFFSET
+movq %fs:PARENT_STACK_FIELD_OFFSET, %rax
+leaq (%rbp,%rax), %rsp
+movq %fs:SCRATCH_RAX_FIELD_OFFSET, %rax
+popq %rbp
+```
+
+The runtime must initialize the field in every thread **before any expanded
+leave executes**, including early loader code. Its value is the signed byte delta
+such that `RBP + parent_stack_offset` addresses the saved frame pointer on the
+resumed stack; the return address must follow it. Zero gives native stack results.
+This delta is independent of the sandbox/GS delta. The pop remains an implicit
+stack access: it receives no GS prefix.
+
+All five instructions preserve flags, and RAX is restored before the pop.
+RSP remains on the current stack until LEA switches directly to the parent stack;
+it never contains the bare delta.
+This is an explicit runtime ABI mode under a parent-stack relocation contract.
+Without either parent-stack
+option, `leave` stays native; native baselines and trusted sections also remain
+unchanged. Prefixed/16-bit leave forms are rejected in parent-stack mode.
+The validator checks the exact expansion and FS slot. Existing RBP-based CFI and
+the post-pop CFI transition are retained; other CFA forms at an expanded leave
+are rejected when unwind rules are present. The runtime remains responsible for
+unwinding logical parent frames and preserving the shared scratch slot on signal
+entry and across nested instrumentation. The report's `leave_wrappers` lists each
+instruction boundary, whether original RAX is in scratch, and whether RSP has
+switched to the parent stack. Phase flags describe state before that instruction.
+Ordinary CFI alone does not recover the temporary RAX value from scratch.
+
 IFUNC resolvers need no special trust flag: their instructions are rewritten by
 the ordinary instruction rules, just like their selected implementations.
 `STT_GNU_IFUNC` symbols retain their resolver type; IRELATIVE relocation addends
@@ -119,6 +222,16 @@ Reports are correctness evidence, not cryptographically authenticated certificat
    No detours, spills, or application-stack scratch are introduced.
 6. Normalize newly generated, unreferenced framework alignment DataBlocks from
    zero-fill into recorded NOP padding through the mutation API.
+   Across both rewrite passes, preserve numeric `SHN_ABS` symbols and numeric
+   symbols outside recovered intervals (including discarded glibc link-warning
+   sections). Framework layout can place data at synthetic address zero; a
+   subsequent pass must not reinterpret constants such as `0` or `0x40` as
+   pointers into that data and create overlapping blocks. Their original values
+   are restored before printing. If the final synthetic layout still covers one
+   of those values, every byte interval is shifted by a 2 MiB multiple so the
+   printer emits the symbol as an integral `.set` rather than a label inside
+   data. IR addresses are relinked anyway, so the shift only removes ambiguity.
+   Overlap diagnostics still fail; they are not suppressed.
 7. Print GNU Intel-syntax assembly with `--layout`, `--policy=complete`, `--keep-all-functions`, and
    `--keep-all-array-sections`. The printer's complete policy links with
    `-nostartfiles -nodefaultlibs`: original startup code is retained, not silently
@@ -144,11 +257,68 @@ relative to regenerated dynamic metadata. Unknown patterns still fail validation
 Initial-exec TLS preserves PT_TLS file size, memory size, alignment, initialized
 data, and each recovered TLS symbol's module-relative offset. Already-resolved
 absolute FS offsets remain numeric; they are not turned back into local-exec
-relocations. Public version aliases at different addresses get private validation
+relocations.
+
+Local-exec TLS (`sym@TPOFF` on a register-based operand, e.g.
+`mov %fs:0,%rax; lea sym@tpoff(%rax),%rax`, including linker GD/LD→LE
+relaxation output) is accepted **only in executables** (`ET_EXEC`, `DF_1_PIE`,
+or `PT_INTERP`), where the main program's TLS block has a static offset. The
+reference stays symbolic so the linker recomputes `R_X86_64_TPOFF32`. The
+rewriter records the module-wide bias between each encoded thread-pointer offset
+and the symbol's module-relative offset; the validator requires every rewritten
+reference to reproduce that bias. A local-exec reference in a shared object is
+rejected. Relaxation leaves a now-unused `__tls_get_addr` import behind; every
+strong (`STB_GLOBAL`) undefined dynamic import is therefore relinked with
+`-Wl,--undefined=NAME` so the dynamic symbol table, including its version, is
+preserved. Weak imports are not forced because that could change their binding.
+
+Public version aliases at different addresses get private validation
 identities without renaming the exported ABI, and reference versions are checked
 at their GOT/PLT/data relocation sites.
 
 ### Generated code and eager binding
+
+**Why this step exists.** Ddisasm reconstructs the program's own code. The output
+linker then generates new PLT stubs after reassembly. As a result, the stubs are
+absent from the GTIRB IR and are not covered by the instrumentation passes. Every
+live PLT stub performs an explicit memory load:
+
+```asm
+jmp  *foo@GOTPCREL(%rip)     # ff 25 <disp32>: reads the GOT entry
+```
+
+The rewritten program accesses data through GS, so this load also needs a `gs`
+prefix. Otherwise, each call to another library or IFUNC target reads a GOT entry
+that is not GS-relative. The final validator rejects any such unprefixed access.
+The rewriter therefore patches these linker-generated stubs after linking.
+
+**Why lazy binding cannot be kept.** A classic lazy `.plt` slot uses all 16 of its
+bytes:
+
+```text
+ff 25 <disp32>     jmp  *GOT[n](%rip)    6 bytes
+68 <imm32>         push $n               5 bytes
+e9 <rel32>         jmp  PLT0             5 bytes
+```
+
+Adding the one-byte GS prefix would make the slot 17 bytes. To make room, the
+rewriter would have to move PLT slots. That would break their symbol addresses,
+the relocations and GOT entries that refer to them, and their unwind ranges. Before
+binding, the lazy path also pushes the relocation index and jumps to PLT0. PLT0
+then makes two more GOT accesses, `push *GOT[1]` and `jmp *GOT[2]`, to enter the
+dynamic resolver.
+
+With eager binding (`DT_BIND_NOW` / `DF_BIND_NOW`, requested from the output linker
+with `-z now`), the loader fills every GOT entry before any code runs. The
+`push`/`jmp PLT0` tails and PLT0 become dead code. The rewriter can then replace them
+instead of trying to instrument code that does not fit.
+
+**Why eager binding is verified, not assumed.** Before binding, each lazy GOT entry
+points to its own slot's `push` tail at `slot+6`. After rewriting, that address is
+inside the NOP padding behind the new seven-byte jump. Execution would fall
+through into the *next* slot and silently call the wrong function. Validation
+therefore rejects any rewritten PLT unless the output ELF carries the eager-binding
+flag.
 
 Recognized GNU ld `.plt` slots are 16 bytes and ordinary `.plt.got` slots are 8 bytes.
 Each live slot becomes a seven-byte GS-relative RIP-indirect jump followed by
@@ -215,7 +385,7 @@ The exact mnemonic allowlist and form checks are in
 | Near direct/register-indirect control flow | Preserve; relocate direct references |
 | Register-indirect NOTRACK CALL/JMP | Preserve the DS/NOTRACK control prefix |
 | Ordinary 64-bit PUSH/POP/CALL/RET, PUSHFQ/POPFQ | Native implicit stack alias |
-| 64-bit LEAVE | Preserve native logical-RBP/logical-RSP semantics |
+| 64-bit LEAVE | Native by default; parent-stack mode spills RAX to FS scratch, computes RSP with LEA, restores RAX, then POPs RBP (flags preserved) |
 | 64-bit-address MOVS/STOS, byte/word/dword/qword, with or without REP | Dedicated family-specific FS-scratch wrapper |
 | Syscall, FS-base, PKRU, and implicit CET shadow-stack controls | Preserve native operation; record runtime-control boundary |
 | Alignment NOP / ignored CS-prefixed NOP | Preserve equivalent no-access padding |
@@ -310,6 +480,8 @@ nested signal handler, restores scratch, and resumes the partial operation.
   for each of 16 MOVS/STOS forms (four widths, repeated/plain), across original
   GS=0, native-reassembly GS=0, rewritten GS=0, and rewritten GS=16 MiB:
   24,576 executions. The original uninstrumented shifted control must SIGSEGV.
+* Local-exec TLS executables (direct `%fs:` and relaxed `%fs:0` + `sym@tpoff`
+  forms) in multiple threads, including a tampered thread-pointer offset.
 * Initial-exec TLS in multiple threads, version aliases at distinct addresses,
   pre-biased table walks, and LOCK-skipping branches.
 * Partial REP fault/restart and nested scratch use.

@@ -28,7 +28,9 @@ def check(build, loader, libc, cxx_runtime=None):
         report = json.loads((report_dir / "report.json").read_text())
         if report["input_sha256"] != hashlib.sha256(original.read_bytes()).hexdigest():
             raise RuntimeError(f"{rewritten}: provenance does not match selected glibc build")
-        if report["runtime"] != {"scratch_rax": -16, "sandbox_offset": -8}:
+        if (report["runtime"].get("scratch_rax") != -16
+                or report["runtime"].get("sandbox_offset") != -8
+                or report["runtime"].get("parent_stack_offset") is not None):
             raise RuntimeError("this fixture reserves FS scratch at -16 and GS offset at -8")
         validations.append(validate_artifact(rewritten, report))
         control = report_dir / "baseline"
@@ -60,7 +62,9 @@ def check(build, loader, libc, cxx_runtime=None):
                 if cxx_runtime is not None:
                     paths.append(cxx_runtime)
                 for name, executable, expected in workloads:
+                    print(f"Running workload {name} with loader {loader_name} and libc {library.name}")
                     output = run([candidate, "--library-path", ":".join(map(str, paths)), executable])
+                    print(f"....... Output:\n{output}")
                     if output != expected:
                         raise RuntimeError(f"unexpected output: {output!r}")
                     executions.append({"loader": loader_name, "libc": library.name,

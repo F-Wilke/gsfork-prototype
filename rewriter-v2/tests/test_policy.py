@@ -44,7 +44,10 @@ class PolicyTests(unittest.TestCase):
                 self.rule(code)
 
     def test_scratch_validation(self):
-        for runtime in (Runtime(0, None), Runtime(0, 4), Runtime(1 << 32, 16)):
+        for runtime in (Runtime(0, None), Runtime(0, 4), Runtime(1 << 32, 16),
+                        Runtime(parent_stack_offset=1 << 31),
+                        Runtime(parent_stack_offset=-(1 << 31) - 1),
+                        Runtime(-16, -8, -12), Runtime(-16, -8, -4)):
             with self.subTest(runtime=runtime), self.assertRaises(RewriteError):
                 runtime.check()
         with self.assertRaisesRegex(RewriteError, "requires explicit"):
@@ -52,6 +55,18 @@ class PolicyTests(unittest.TestCase):
         for code in (b"\x0f", b"\x65" * 15 + b"\x90"):
             with self.assertRaises(RewriteError):
                 decode(code, 0)
+
+    def test_leave_runtime_mode(self):
+        runtime = Runtime(-16, -8, 720)
+        self.assertEqual(classify(decode(b"\xc9", 0)[0], runtime), "leave")
+        self.assertEqual(classify(decode(b"\xc9", 0)[0]), "native")
+        self.assertIn("movq %fs:720, %rax", runtime.leave())
+        self.assertIn("leaq (%rbp,%rax), %rsp", runtime.leave())
+        with self.assertRaisesRegex(RewriteError, "scratch-rax"):
+            classify(decode(b"\xc9", 0)[0], Runtime(parent_stack_offset=720))
+        for code in ("66c9", "67c9", "48c9", "64c9", "f3c9"):
+            with self.subTest(code=code), self.assertRaises(RewriteError):
+                classify(decode(bytes.fromhex(code), 0)[0], runtime)
 
 
 if __name__ == "__main__":

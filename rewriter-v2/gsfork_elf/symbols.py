@@ -1,9 +1,59 @@
+from bisect import bisect_left
 from collections import defaultdict
+from contextlib import contextmanager
 
 import gtirb
 from iced_x86 import Decoder, Register
 
 from .errors import RewriteError
+
+
+@contextmanager
+def preserve_integral_symbols(module):
+    """Keep numeric constants from becoming addresses after framework layout."""
+    info = module.aux_data["elfSymbolInfo"].data
+    values = {
+        symbol: symbol.value for symbol in module.symbols
+        if symbol.value is not None
+        and (info.get(symbol, (0, "", "", "", 0))[4] == 0xFFF1  # SHN_ABS
+             or not (any(module.byte_intervals_on(symbol.value))
+                     or any(module.byte_intervals_on(symbol.value - 1))))
+    }
+    # gtirb-layout otherwise binds these to unrelated blocks when a later pass
+    # reuses their values as synthetic addresses (notably 0 and 0x40 in libc).
+    for symbol in values:
+        symbol.value = None
+    try:
+        yield
+        _shift_layout_clear_of(module, set(values.values()))
+    finally:
+        for symbol, value in values.items():
+            symbol.value = value
+
+
+_LAYOUT_SHIFT = 0x200000  # preserves any section alignment up to 2 MiB
+
+
+def _shift_layout_clear_of(module, constants):
+    """Move synthetic framework layout so the printer cannot treat constants as labels."""
+    intervals = list(module.byte_intervals)
+    if not intervals or not constants:
+        return
+    if any(bi.address is None for bi in intervals):
+        raise RewriteError(f"{module.name}: rewritten layout left byte intervals without addresses")
+    low = min(bi.address for bi in intervals)
+    high = max(bi.address + bi.size for bi in intervals)
+    points = sorted(constants)
+    shift = 0
+    while high + shift < 1 << 47:
+        index = bisect_left(points, low + shift)
+        if index == len(points) or points[index] > high + shift:
+            break
+        shift = (points[index] - low) // _LAYOUT_SHIFT * _LAYOUT_SHIFT + _LAYOUT_SHIFT
+    else:
+        raise RewriteError(f"{module.name}: no address range avoids integral symbol values")
+    for interval in intervals:
+        interval.address += shift
 
 
 def uniquify_locals(module):
