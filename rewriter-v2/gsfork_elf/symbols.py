@@ -8,6 +8,13 @@ from iced_x86 import Decoder, Register
 from .errors import RewriteError
 
 
+def complete_elf_symbol_info(module):
+    """Give generated labels ELF metadata before the printer examines aliases."""
+    info = module.aux_data["elfSymbolInfo"].data
+    for symbol in module.symbols:
+        info.setdefault(symbol, (0, "NOTYPE", "LOCAL", "DEFAULT", 0))
+
+
 @contextmanager
 def preserve_integral_symbols(module):
     """Keep numeric constants from becoming addresses after framework layout."""

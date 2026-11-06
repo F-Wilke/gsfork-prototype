@@ -1,16 +1,20 @@
+import gc
 import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+from collections import defaultdict
 from dataclasses import asdict
 from contextlib import contextmanager
 from pathlib import Path
 
 import gtirb
+import gtirb_rewriting.prepare
 from gtirb_rewriting import Constraints, Pass, PassManager, Patch
 from iced_x86 import Decoder, Mnemonic, OpKind, Register
 
@@ -22,7 +26,7 @@ from .plt import PLT_SECTIONS, patch_plt, pointer_identity
 from .policy import Runtime, classify, decode
 from .recovery import repair_masked_table_bases
 from .validator import tls_bias
-from .symbols import (add_reference_aliases, preserve_integral_symbols, preserve_resolved_fs_offsets,
+from .symbols import (add_reference_aliases, complete_elf_symbol_info, preserve_integral_symbols, preserve_resolved_fs_offsets,
                       resolver_symbols, restore_linker_symbols,
                       uniquify_locals, verify_tls)
 
@@ -42,16 +46,66 @@ def tool(name):
     return value
 
 
+def recovery_threads():
+    """Souffle worker threads for Ddisasm; the recovered IR does not depend on the count."""
+    value = os.environ.get("GSFORK_DDISASM_THREADS")
+    if value is not None:
+        if not value.isdigit() or int(value) < 1:
+            raise RewriteError(f"GSFORK_DDISASM_THREADS must be a positive integer, not {value!r}")
+        return int(value)
+    return max(1, min(8, len(os.sched_getaffinity(0))))
+
+
+def _descendants(pid):
+    children = defaultdict(list)
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            stat = Path(f"/proc/{entry}/stat").read_text()
+        except OSError:
+            continue
+        children[int(stat[stat.rindex(")") + 2:].split()[1])].append(int(entry))
+    found, pending = [], [pid]
+    while pending:
+        for child in children.get(pending.pop(), ()):
+            found.append(child)
+            pending.append(child)
+    return found
+
+
+def _kill_tree(process):
+    # The installed ddisasm/gtirb-pprinter entry points are Python wrappers that
+    # run the real tool as a grandchild holding our output pipe. Killing only
+    # the wrapper leaves that tool running and communicate() waiting for it.
+    for pid in [process.pid] + _descendants(process.pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def execute(command, timeout):
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        stdout, _ = process.communicate(timeout=timeout)
+    except BaseException:
+        _kill_tree(process)
+        process.communicate()
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout)
+
+
 def run(command, log, *, allow_absent_entry=False, repair_header_symbol=False, local_ifunc_names=(),
         recovery_image=None):
     try:
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, timeout=300, check=False)
+        result = execute(command, int(os.environ.get("GSFORK_TOOL_TIMEOUT", "300")))
     except (OSError, subprocess.TimeoutExpired) as error:
         raise RewriteError(f"tool execution failed: {command[0]}: {error}") from error
     Path(log).write_text("COMMAND: " + repr(command) + "\n" + result.stdout)
     diagnostics = result.stdout
     local_tls_names = set()
+    recovered = None
     if not result.returncode and recovery_image is not None and recovery_image.tls is not None:
         recovered = gtirb.IR.load_protobuf(command[command.index("--ir") + 1])
         if len(recovered.modules) != 1:
@@ -67,8 +121,15 @@ def run(command, log, *, allow_absent_entry=False, repair_header_symbol=False, l
     for name in set(local_ifunc_names) | set(local_tls_names):
         diagnostic = "WARNING: Could not find GLOBAL/WEAK symbol for "
         diagnostics = diagnostics.replace(f"{diagnostic}\n{diagnostic}{name}\n", "")
+    # gtirb-pprinter echoes the link command; symbol names such as `error`
+    # in -Wl,--undefined=... are not diagnostics. Neither are libc's
+    # .gnu.warning link notes ("the use of `mktemp' is dangerous ...").
+    diagnostics = "\n".join(line for line in diagnostics.splitlines()
+                            if not line.startswith("Compiler arguments:")
+                            and not re.search(r"ld: warning: the use of `\w+' is dangerous", line))
     if result.returncode or re.search(r"\b(?:warning|error|failed)\b", diagnostics, re.I):
         raise RewriteError(f"{command[0]} failed or reported recovery/link diagnostics:\n{result.stdout}")
+    return recovered
 
 
 def expression(expr, module, resolvers):
@@ -154,16 +215,17 @@ class Transform(Pass):
             for block in blocks:
                 if not block.size:
                     continue
+                contents = bytes(block.contents)
                 if executable and section.name in PLT_SECTIONS:
                     if isinstance(block, gtirb.CodeBlock):
-                        for ins in decode(bytes(block.contents), block.address):
+                        for ins in decode(contents, block.address):
                             slot = next(s for s in self.plt_slots
                                         if s["address"] <= ins.ip < s["address"] + s["size"])
                             self.retired.append({"section": section.name, "original": ins.ip,
                                                  "slot": slot["address"],
                                                  "symbol": (pointer_identity(self.image, slot["target"])
                                                             if slot["target"] is not None else None),
-                                                 "bytes": bytes(block.contents)[
+                                                 "bytes": contents[
                                                      ins.ip - block.address:ins.next_ip - block.address].hex()})
                     continue
                 begin, end = marker(module, block, index)
@@ -175,7 +237,7 @@ class Transform(Pass):
                     continue
                 record["trusted"] = section.name in self.trusted_sections
                 record["instructions"] = []
-                instructions = decode(bytes(block.contents), block.address)
+                instructions = decode(contents, block.address)
                 for ins in instructions:
                     try:
                         if self.baseline:
@@ -192,7 +254,7 @@ class Transform(Pass):
                     if len(exprs) > 1:
                         fail(self.image.path, section.name, ins.ip, "multiple symbolic instruction fields unsupported")
                     if exprs:
-                        decoder = Decoder(64, bytes(block.contents)[ins.ip - block.address:], ip=ins.ip)
+                        decoder = Decoder(64, contents[ins.ip - block.address:ins.next_ip - block.address], ip=ins.ip)
                         decoded = decoder.decode()
                         offsets = decoder.get_constant_offsets(decoded)
                         location = fields[0][0] - low
@@ -221,12 +283,12 @@ class Transform(Pass):
                             fail(self.image.path, section.name, ins.ip,
                                  "local-exec TLS references disagree on the thread-pointer bias")
                         self.tls_bias = exprs[0]["tls_bias"] = bias
-                    item = {"original": ins.ip, "bytes": bytes(block.contents)[
+                    item = {"original": ins.ip, "bytes": contents[
                         ins.ip - block.address:ins.next_ip - block.address].hex(),
                         "rule": rule, "expression": exprs[0] if exprs else None,
                         "unwind": self.metadata.state(ins.ip)}
                     item["lock_suffix_entry"] = (ins.has_lock_prefix
-                                                 and bytes(block.contents)[ins.ip - block.address] == 0xF0)
+                                                 and contents[ins.ip - block.address] == 0xF0)
                     record["instructions"].append(item)
                     if self.baseline or record["trusted"]:
                         continue
@@ -301,15 +363,15 @@ class Transform(Pass):
         record["bytes"] = bytes(block.contents).hex()
         record["size"] = block.size
         record["expressions"] = []
-        for offset, expr in block.byte_interval.symbolic_expressions.items():
-            if block.offset <= offset < block.offset + block.size:
-                sizes = module.aux_data["symbolicExpressionSizes"].data
-                size = sizes.get(gtirb.Offset(block.byte_interval, offset))
-                if size not in (1, 2, 4, 8):
-                    fail(self.image.path, block.section.name, block.address,
-                         "unsupported data symbolic-expression width")
-                record["expressions"].append({"offset": offset - block.offset,
-                                               "size": size, "expression": expression(expr, module, self.resolvers)})
+        for _, offset, expr in block.byte_interval.symbolic_expressions_at_offset(
+                range(block.offset, block.offset + block.size)):
+            sizes = module.aux_data["symbolicExpressionSizes"].data
+            size = sizes.get(gtirb.Offset(block.byte_interval, offset))
+            if size not in (1, 2, 4, 8):
+                fail(self.image.path, block.section.name, block.address,
+                     "unsupported data symbolic-expression width")
+            record["expressions"].append({"offset": offset - block.offset,
+                                           "size": size, "expression": expression(expr, module, self.resolvers)})
         record["executable"] = executable
         if executable:
             from .validator import padding
@@ -321,27 +383,31 @@ class Transform(Pass):
         self.data.append(record)
 
 
-class NormalizePadding(Pass):
-    def __init__(self, transform):
-        self.transform = transform
-
-    def begin_module(self, module, functions, context):
-        for block in sorted(module.data_blocks, key=lambda b: b.address):
-            if (gtirb.Section.Flag.Executable not in block.section.flags
-                    or block.uuid in self.transform.input_data_ids):
-                continue
-            if (any(block.contents) or list(block.references)
-                    or any(block.offset <= off < block.offset + block.size
-                           for off in block.byte_interval.symbolic_expressions)):
-                raise RewriteError("framework generated non-padding executable data")
-            begin, end = marker(module, block, f"padding_{len(self.transform.data)}")
-            self.transform.data.append({
-                "section": block.section.name, "original": None, "original_size": 0,
-                "begin": begin, "end": end, "bytes": (b"\x90" * block.size).hex(),
-                "size": block.size, "expressions": [], "executable": True,
-                "generated": "framework-alignment",
-            })
-            context.replace_at(block, 0, block.size, b"\x90" * block.size)
+def normalize_padding(module, transform):
+    contents = {}
+    for block in sorted(module.data_blocks, key=lambda b: b.address):
+        if (gtirb.Section.Flag.Executable not in block.section.flags
+                or block.uuid in transform.input_data_ids):
+            continue
+        if (any(block.contents) or list(block.references)
+                or any(block.byte_interval.symbolic_expressions_at_offset(
+                    range(block.offset, block.offset + block.size)))):
+            raise RewriteError("framework generated non-padding executable data")
+        begin, end = marker(module, block, f"padding_{len(transform.data)}")
+        padding = b"\x90" * block.size
+        transform.data.append({
+            "section": block.section.name, "original": None, "original_size": 0,
+            "begin": begin, "end": end, "bytes": padding.hex(),
+            "size": block.size, "expressions": [], "executable": True,
+            "generated": "framework-alignment",
+        })
+        interval = block.byte_interval
+        if interval not in contents:
+            contents[interval] = bytearray(interval.contents)
+        contents[interval][block.offset:block.offset + block.size] = padding
+    # Equal-sized data replacements need no CFG, symbol, or offset relocation.
+    for interval, data in contents.items():
+        interval.contents = bytes(data)
 
 
 def print_ir(ir_path, binary, assembly, log, library_paths, *, image=None, entry_symbol=None,
@@ -377,6 +443,42 @@ def print_ir(ir_path, binary, assembly, log, library_paths, *, image=None, entry
 
 
 @contextmanager
+def linear_interval_split():
+    """Make gtirb-rewriting's per-block interval split linear in interval size.
+
+    split_byte_interval() moves blocks out from the end of an interval and
+    shrinks it after each one through ByteInterval.initialized_size, whose
+    setter copies all remaining bytes (`contents = contents[:n]`). That is
+    quadratic: about 150 seconds for Perl's 3.6 MB .text with 392K blocks.
+    While the split runs, shrink the bytearray in place instead. The split only
+    keeps copied slices of the original contents, so no alias observes it.
+    """
+    original_split = gtirb_rewriting.prepare.split_byte_interval
+    copying = gtirb.ByteInterval.initialized_size
+
+    def truncate(interval, value):
+        if isinstance(interval.contents, bytearray) and value < len(interval.contents):
+            del interval.contents[value:]
+        else:
+            copying.fset(interval, value)
+
+    in_place = property(copying.fget, truncate, doc=copying.__doc__)
+
+    def split(*args, **kwargs):
+        gtirb.ByteInterval.initialized_size = in_place
+        try:
+            return original_split(*args, **kwargs)
+        finally:
+            gtirb.ByteInterval.initialized_size = copying
+
+    gtirb_rewriting.prepare.split_byte_interval = split
+    try:
+        yield
+    finally:
+        gtirb_rewriting.prepare.split_byte_interval = original_split
+
+
+@contextmanager
 def workspace(output):
     with tempfile.TemporaryDirectory(prefix=".gsfork-", dir=output.parent) as temporary:
         work = Path(temporary)
@@ -388,6 +490,72 @@ def workspace(output):
                 if path.suffix in (".log", ".S", ".gtirb", ".json"):
                     shutil.copy2(path, diagnostics / path.name)
             raise RewriteError(f"{error}\nDiagnostics retained in {diagnostics}") from error
+
+
+def recover_and_transform(source, work, image, metadata, runtime, trusted_sections, baseline,
+                          library_paths):
+    """Recover, instrument, and save the IR; return only plain report data.
+
+    Keeping every GTIRB object local to this frame releases the in-memory IR
+    (gigabytes for large programs) before printing, linking, and validation.
+    """
+    original_ir = work / "original.gtirb"
+    no_entry = (image.elf["e_type"] == "ET_DYN" and not image.elf["e_entry"]
+                and not any(s["p_type"] == "PT_INTERP" for s in image.elf.iter_segments()))
+    ir = run([tool("ddisasm"), str(source), "--ir", str(original_ir), "-j", str(recovery_threads())],
+             work / "recovery.log",
+             allow_absent_entry=no_entry, repair_header_symbol=image.symbols.get("__ehdr_start") == 0,
+             local_ifunc_names=image.local_ifunc_names, recovery_image=image)
+    if ir is None:
+        ir = gtirb.IR.load_protobuf(original_ir)
+    if (len(ir.modules) != 1 or ir.modules[0].isa != gtirb.Module.ISA.X64
+            or ir.modules[0].file_format != gtirb.Module.FileFormat.ELF):
+        raise RewriteError("Ddisasm returned an unexpected module/ISA/file format")
+    module = ir.modules[0]
+    if any(s.name.startswith("__gsfork_") for s in module.symbols):
+        raise RewriteError("input already contains reserved __gsfork_ provenance symbols")
+    verify_tls(module, image)
+    fs_offsets = preserve_resolved_fs_offsets(module)
+    local_renames = uniquify_locals(module)
+    linker_symbols = restore_linker_symbols(module, image)
+    resolvers = resolver_symbols(module, image)
+    reference_repairs = repair_masked_table_bases(module)
+    add_reference_aliases(module)
+    entry_symbol = None
+    initializers = []
+    for tag, address in image.init_fini.items():
+        flag = "init" if tag == "DT_INIT" else "fini"
+        block = next((b for b in module.code_blocks if b.address == address), None)
+        if block is None:
+            raise RewriteError(f"{source}: {tag} entry was not recovered")
+        name = "__gsfork_" + flag
+        symbol = gtirb.Symbol(name, payload=block, module=module)
+        module.aux_data["elfSymbolInfo"].data[symbol] = (0, "NOTYPE", "GLOBAL", "HIDDEN", 0)
+        initializers.append((flag, name))
+    if image.elf["e_entry"]:
+        if module.entry_point is None or module.entry_point.address != image.elf["e_entry"]:
+            raise RewriteError(f"{source}: Ddisasm did not preserve the ELF entry point")
+        entry_symbol = "__gsfork_entry"
+        entry = gtirb.Symbol(entry_symbol, payload=module.entry_point, module=module)
+        module.aux_data["elfSymbolInfo"].data[entry] = (0, "NOTYPE", "GLOBAL", "HIDDEN", 0)
+    complete_elf_symbol_info(module)
+    ir.save_protobuf(original_ir)
+    # Establish a native relinking control before touching instruction semantics.
+    print_ir(original_ir, work / "baseline", work / "baseline.S",
+             work / "baseline.log", library_paths, image=image, entry_symbol=entry_symbol,
+             initializers=initializers)
+    transform = Transform(image, metadata, runtime, trusted_sections, baseline, resolvers)
+    with preserve_integral_symbols(module), linear_interval_split():
+        # Patch boundaries come from decode() above; avoid re-disassembling
+        # the entire block for every insertion just to assert them again.
+        passes = PassManager(expensive_assertions=False)
+        passes.add(transform)
+        passes.run(ir)
+        normalize_padding(module, transform)
+    complete_elf_symbol_info(module)
+    ir.save_protobuf(work / "rewritten.gtirb")
+    return (entry_symbol, initializers, transform, fs_offsets, local_renames, linker_symbols,
+            resolvers, reference_repairs)
 
 
 def rewrite(input_path, output_path, *, baseline=False, runtime=Runtime(),
@@ -408,58 +576,11 @@ def rewrite(input_path, output_path, *, baseline=False, runtime=Runtime(),
     metadata = Metadata(image)
     patch_plt(image, require_now=False)
     with workspace(output) as work:
-        original_ir = work / "original.gtirb"
-        no_entry = (image.elf["e_type"] == "ET_DYN" and not image.elf["e_entry"]
-                    and not any(s["p_type"] == "PT_INTERP" for s in image.elf.iter_segments()))
-        run([tool("ddisasm"), str(source), "--ir", str(original_ir), "-j", "1"], work / "recovery.log",
-            allow_absent_entry=no_entry, repair_header_symbol=image.symbols.get("__ehdr_start") == 0,
-            local_ifunc_names=image.local_ifunc_names, recovery_image=image)
-        ir = gtirb.IR.load_protobuf(original_ir)
-        if (len(ir.modules) != 1 or ir.modules[0].isa != gtirb.Module.ISA.X64
-                or ir.modules[0].file_format != gtirb.Module.FileFormat.ELF):
-            raise RewriteError("Ddisasm returned an unexpected module/ISA/file format")
-        module = ir.modules[0]
-        if any(s.name.startswith("__gsfork_") for s in module.symbols):
-            raise RewriteError("input already contains reserved __gsfork_ provenance symbols")
-        verify_tls(module, image)
-        fs_offsets = preserve_resolved_fs_offsets(module)
-        local_renames = uniquify_locals(module)
-        linker_symbols = restore_linker_symbols(module, image)
-        resolvers = resolver_symbols(module, image)
-        reference_repairs = repair_masked_table_bases(module)
-        add_reference_aliases(module)
-        entry_symbol = None
-        initializers = []
-        for tag, address in image.init_fini.items():
-            flag = "init" if tag == "DT_INIT" else "fini"
-            block = next((b for b in module.code_blocks if b.address == address), None)
-            if block is None:
-                raise RewriteError(f"{source}: {tag} entry was not recovered")
-            name = "__gsfork_" + flag
-            symbol = gtirb.Symbol(name, payload=block, module=module)
-            module.aux_data["elfSymbolInfo"].data[symbol] = (0, "NOTYPE", "GLOBAL", "HIDDEN", 0)
-            initializers.append((flag, name))
-        if image.elf["e_entry"]:
-            if module.entry_point is None or module.entry_point.address != image.elf["e_entry"]:
-                raise RewriteError(f"{source}: Ddisasm did not preserve the ELF entry point")
-            entry_symbol = "__gsfork_entry"
-            entry = gtirb.Symbol(entry_symbol, payload=module.entry_point, module=module)
-            module.aux_data["elfSymbolInfo"].data[entry] = (0, "NOTYPE", "GLOBAL", "HIDDEN", 0)
-        ir.save_protobuf(original_ir)
-        # Establish a native relinking control before touching instruction semantics.
-        print_ir(original_ir, work / "baseline", work / "baseline.S",
-                 work / "baseline.log", library_paths, image=image, entry_symbol=entry_symbol,
-                 initializers=initializers)
-        transform = Transform(image, metadata, runtime, trusted_sections, baseline, resolvers)
-        with preserve_integral_symbols(module):
-            passes = PassManager()
-            passes.add(transform)
-            passes.run(ir)
-            padding_passes = PassManager()
-            padding_passes.add(NormalizePadding(transform))
-            padding_passes.run(ir)
+        (entry_symbol, initializers, transform, fs_offsets, local_renames, linker_symbols,
+         resolvers, reference_repairs) = recover_and_transform(
+            source, work, image, metadata, runtime, trusted_sections, baseline, library_paths)
+        gc.collect()
         rewritten_ir = work / "rewritten.gtirb"
-        ir.save_protobuf(rewritten_ir)
         staged = work / "output"
         print_ir(rewritten_ir, staged, work / "output.S", work / "link.log", library_paths,
                  image=image, entry_symbol=entry_symbol, initializers=initializers)
@@ -498,14 +619,35 @@ def rewrite(input_path, output_path, *, baseline=False, runtime=Runtime(),
             "toolchain": {"ddisasm": "1.9.5", "gtirb-rewriting": "0.4.1", "gtirb-pprinter": "2.2.5"},
         }
         pending_report = work / "unvalidated-report.json"
-        pending_report.write_text(json.dumps(report, indent=2) + "\n")
+        write_report(pending_report, report)
         report["validation"] = validate_artifact(staged, report)
         pending_report.unlink()
-        (work / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+        write_report(work / "report.json", report)
         staged.chmod(source.stat().st_mode & 0o777 & ~0o022)
         os.rename(work, artifacts)
         os.rename(artifacts / "output", output)
     return report
+
+
+def write_report(path, report):
+    """Write one top-level key, or one list record, per line.
+
+    json.dump(indent=...) always uses CPython's pure-Python encoder, which took
+    minutes for the per-instruction provenance of large programs. Serializing
+    each record separately keeps the C encoder and bounds the temporary string.
+    """
+    with Path(path).open("w") as stream:
+        stream.write("{\n")
+        for number, (key, value) in enumerate(report.items()):
+            stream.write(("" if number == 0 else ",\n") + "  " + json.dumps(key) + ": ")
+            if isinstance(value, list) and value:
+                stream.write("[\n")
+                for index, record in enumerate(value):
+                    stream.write(("" if index == 0 else ",\n") + "    " + json.dumps(record))
+                stream.write("\n  ]")
+            else:
+                stream.write(json.dumps(value))
+        stream.write("\n}\n")
 
 
 def order_lock_prefixes(image):

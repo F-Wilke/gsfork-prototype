@@ -1,12 +1,62 @@
 import io
+import struct
 from collections import defaultdict
 from pathlib import Path
 
 from elftools.elf.elffile import ELFFile
+from elftools.elf.enums import (ENUM_ST_INFO_BIND, ENUM_ST_INFO_TYPE, ENUM_ST_SHNDX,
+                                ENUM_ST_VISIBILITY, ENUM_VERSYM)
 from elftools.elf.relocation import RelocationSection
 from elftools.elf.sections import SymbolTableSection
 
 from .errors import RewriteError, fail
+
+
+def _decoder(enum):
+    return {value: name for name, value in enum.items() if name != "_default_"}
+
+
+_BIND, _TYPE, _VISIBILITY, _SHNDX, _VERSYM = map(
+    _decoder, (ENUM_ST_INFO_BIND, ENUM_ST_INFO_TYPE, ENUM_ST_VISIBILITY, ENUM_ST_SHNDX, ENUM_VERSYM))
+_SYMBOL = struct.Struct("<IBBHQQ")
+_RELA, _REL = struct.Struct("<QQq"), struct.Struct("<QQ")
+
+
+class _Symbol:
+    """The pyelftools symbol fields this module reads, decoded without construct."""
+    __slots__ = ("name", "value", "size", "type", "bind", "visibility", "shndx")
+
+
+def _symbols(data, section, strings):
+    # Equivalent to pyelftools' iter_symbols() for ELF64 little-endian, whose
+    # construct-based parsing is the dominant cost for large symbol tables.
+    entry_size = section["sh_entsize"]
+    if entry_size < _SYMBOL.size:
+        raise RewriteError(f"{section.name}: invalid symbol entry size {entry_size}")
+    base, string_base = section["sh_offset"], strings["sh_offset"]
+    result = []
+    for index in range(section["sh_size"] // entry_size):
+        st_name, info, other, shndx, value, size = _SYMBOL.unpack_from(data, base + index * entry_size)
+        start = string_base + st_name
+        end = data.find(b"\0", start)
+        raw = data[start:end if end >= 0 else len(data)]
+        symbol = _Symbol()
+        symbol.name = raw.decode("utf-8", errors="replace") if raw else ""
+        symbol.value, symbol.size = value, size
+        symbol.bind, symbol.type = _BIND.get(info >> 4, info >> 4), _TYPE.get(info & 0xF, info & 0xF)
+        symbol.visibility = _VISIBILITY.get(other & 7, other & 7)
+        symbol.shndx = _SHNDX.get(shndx, shndx)
+        result.append(symbol)
+    return result
+
+
+def _relocations(data, section):
+    rela = section.is_RELA()
+    layout = _RELA if rela else _REL
+    base = section["sh_offset"]
+    for index in range(section["sh_size"] // layout.size):
+        fields = layout.unpack_from(data, base + index * layout.size)
+        yield fields[0], fields[1] >> 32, fields[1] & 0xFFFFFFFF, fields[2] if rela else 0
 
 
 class Image:
@@ -76,75 +126,85 @@ class Image:
                 if not version["vd_flags"] & 1:
                     self.version_definitions.append(names)
         versym = self.elf.get_section_by_name(".gnu.version")
-        for section in self.sections:
+        table_symbols = {}
+        for section_index, section in enumerate(self.sections):
             if isinstance(section, SymbolTableSection):
-                for index, symbol in enumerate(section.iter_symbols()):
-                    if symbol["st_info"]["type"] == "STT_TLS" and symbol["st_shndx"] != "SHN_UNDEF":
-                        self.tls_symbols[symbol.name] = (symbol["st_value"], symbol["st_size"])
-                        if symbol["st_info"]["bind"] == "STB_LOCAL":
+                symbols = _symbols(self.data, section, self.elf.get_section(section["sh_link"]))
+                table_symbols[section_index] = symbols
+                for index, symbol in enumerate(symbols):
+                    if symbol.type == "STT_TLS" and symbol.shndx != "SHN_UNDEF":
+                        self.tls_symbols[symbol.name] = (symbol.value, symbol.size)
+                        if symbol.bind == "STB_LOCAL":
                             self.local_tls_names.add(symbol.name)
-                    if symbol["st_shndx"] != "SHN_UNDEF" and symbol.name:
-                        self.symbol_addresses[symbol.name].add(symbol["st_value"])
+                    if symbol.shndx != "SHN_UNDEF" and symbol.name:
+                        self.symbol_addresses[symbol.name].add(symbol.value)
                     if section.name == ".dynsym" and symbol.name:
-                        self.dynamic_symbols.append((symbol.name, symbol["st_info"]["type"]))
-                        if symbol["st_shndx"] == "SHN_UNDEF" and symbol["st_info"]["bind"] == "STB_GLOBAL":
+                        self.dynamic_symbols.append((symbol.name, symbol.type))
+                        if symbol.shndx == "SHN_UNDEF" and symbol.bind == "STB_GLOBAL":
                             self.strong_imports.append(symbol.name)
-                        ndx = versym.get_symbol(index)["ndx"] if versym else "VER_NDX_GLOBAL"
+                        if versym:
+                            entry = versym["sh_offset"] + index * versym["sh_entsize"]
+                            raw = int.from_bytes(self.data[entry:entry + 2], "little")
+                            ndx = _VERSYM.get(raw, raw)
+                        else:
+                            ndx = "VER_NDX_GLOBAL"
                         version = versions.get(ndx & 0x7FFF, "") if isinstance(ndx, int) else ""
                         hidden = bool(ndx & 0x8000) if isinstance(ndx, int) else False
                         self.dynamic_versions[index] = version
-                        self.symbol_versions.append((symbol.name, symbol["st_info"]["type"],
-                                                     symbol["st_info"]["bind"], symbol["st_other"]["visibility"],
-                                                     version, hidden))
-                    if symbol["st_info"]["type"] in ("STT_GNU_IFUNC", "STT_LOOS"):
-                        if symbol["st_shndx"] != "SHN_UNDEF":
-                            self.ifuncs.append((symbol.name, symbol["st_value"], symbol["st_size"]))
-                            if symbol["st_info"]["bind"] == "STB_LOCAL":
+                        self.symbol_versions.append((symbol.name, symbol.type, symbol.bind,
+                                                     symbol.visibility, version, hidden))
+                    if symbol.type in ("STT_GNU_IFUNC", "STT_LOOS"):
+                        if symbol.shndx != "SHN_UNDEF":
+                            self.ifuncs.append((symbol.name, symbol.value, symbol.size))
+                            if symbol.bind == "STB_LOCAL":
                                 self.local_ifunc_names.add(symbol.name)
-                    if (symbol["st_info"]["type"] in ("STT_FUNC", "STT_GNU_IFUNC", "STT_LOOS")
-                            and symbol["st_shndx"] != "SHN_UNDEF"
-                            and symbol["st_size"]):
-                        self.function_ranges.append((symbol.name, symbol["st_value"], symbol["st_size"]))
+                    if (symbol.type in ("STT_FUNC", "STT_GNU_IFUNC", "STT_LOOS")
+                            and symbol.shndx != "SHN_UNDEF"
+                            and symbol.size):
+                        self.function_ranges.append((symbol.name, symbol.value, symbol.size))
         self.symbols = {name: next(iter(addresses)) for name, addresses in self.symbol_addresses.items()
                         if len(addresses) == 1}
+        executable_ranges = [(s["sh_addr"], s["sh_addr"] + s["sh_size"]) for s in self.executable]
         for name, address, _ in self.ifuncs:
-            if not any(s["sh_addr"] <= address < s["sh_addr"] + s["sh_size"] for s in self.executable):
+            if not any(low <= address < high for low, high in executable_ranges):
                 fail(path, ".dynsym/.symtab", address, f"IFUNC resolver {name} is outside executable code")
         self.relocations = {}
         for section in self.sections:
             if isinstance(section, RelocationSection) and section["sh_flags"] & 2:
-                symbols = self.elf.get_section(section["sh_link"])
-                for reloc in section.iter_relocations():
-                    kind = reloc["r_info_type"]
+                link = section["sh_link"]
+                if link not in table_symbols:
+                    linked = self.elf.get_section(link)
+                    table_symbols[link] = _symbols(self.data, linked, self.elf.get_section(linked["sh_link"]))
+                symbols = table_symbols[link]
+                for offset, symbol_index, kind, addend in _relocations(self.data, section):
                     if kind == 0:
-                        if (reloc["r_offset"] or reloc["r_info_sym"]
-                                or (reloc.is_RELA() and reloc["r_addend"])):
-                            fail(path, section.name, reloc["r_offset"], "noncanonical R_X86_64_NONE entry")
+                        if offset or symbol_index or addend:
+                            fail(path, section.name, offset, "noncanonical R_X86_64_NONE entry")
                         continue
                     if kind not in (1, 5, 6, 7, 8, 18, 37):
                         raise RewriteError(f"{path}: unsupported dynamic relocation {kind} (TLS requires layout validation)")
-                    if any(s["sh_addr"] <= reloc["r_offset"] < s["sh_addr"] + s["sh_size"]
-                           for s in self.executable):
-                        fail(path, section.name, reloc["r_offset"], "dynamic text relocation")
-                    symbol = symbols.get_symbol(reloc["r_info_sym"])
+                    if any(low <= offset < high for low, high in executable_ranges):
+                        fail(path, section.name, offset, "dynamic text relocation")
+                    if symbol_index >= len(symbols):
+                        raise RewriteError(f"{path}: relocation at 0x{offset:x} names a missing symbol")
+                    symbol = symbols[symbol_index]
                     name = symbol.name
-                    width = symbol["st_size"] if kind == 5 else 8
-                    if self.section_at(reloc["r_offset"], width) is None:
-                        fail(path, section.name, reloc["r_offset"], "dynamic relocation outside allocated memory")
-                    self.relocations[reloc["r_offset"]] = {
-                        "symbol": name, "type": kind, "addend": reloc["r_addend"] if reloc.is_RELA() else 0,
-                        "version": self.dynamic_versions.get(reloc["r_info_sym"], ""),
+                    width = symbol.size if kind == 5 else 8
+                    if self.section_at(offset, width) is None:
+                        fail(path, section.name, offset, "dynamic relocation outside allocated memory")
+                    self.relocations[offset] = {
+                        "symbol": name, "type": kind, "addend": addend,
+                        "version": self.dynamic_versions.get(symbol_index, ""),
                     }
                     if kind == 18:
-                        if name and symbol["st_info"]["type"] != "STT_TLS":
-                            fail(path, section.name, reloc["r_offset"], "TPOFF64 references a non-TLS symbol")
-                        if not name and (self.tls is None or not 0 <= reloc["r_addend"] < self.tls["memory_size"]):
-                            fail(path, section.name, reloc["r_offset"], "TPOFF64 offset is outside the module TLS image")
+                        if name and symbol.type != "STT_TLS":
+                            fail(path, section.name, offset, "TPOFF64 references a non-TLS symbol")
+                        if not name and (self.tls is None or not 0 <= addend < self.tls["memory_size"]):
+                            fail(path, section.name, offset, "TPOFF64 offset is outside the module TLS image")
                     if kind == 37:
-                        resolver = self.relocations[reloc["r_offset"]]["addend"]
-                        if name or not any(s["sh_addr"] <= resolver < s["sh_addr"] + s["sh_size"]
-                                           for s in self.executable):
-                            fail(path, section.name, reloc["r_offset"], "invalid IRELATIVE resolver reference")
+                        resolver = self.relocations[offset]["addend"]
+                        if name or not any(low <= resolver < high for low, high in executable_ranges):
+                            fail(path, section.name, offset, "invalid IRELATIVE resolver reference")
         dynamic = self.elf.get_section_by_name(".dynamic")
         tags = list(dynamic.iter_tags()) if dynamic else []
         self.libraries = [t.needed for t in tags if t.entry.d_tag == "DT_NEEDED"]
@@ -169,10 +229,12 @@ class Image:
             raise RewriteError(f"{path}: unsupported dynamic relocation/audit feature")
 
     def section_at(self, address, size=1):
-        return next((s for s in self.sections if s["sh_flags"] & 2
-                     and not (s["sh_flags"] & 0x400 and s["sh_type"] == "SHT_NOBITS")
-                     and s["sh_addr"] <= address
-                     and address + size <= s["sh_addr"] + s["sh_size"]), None)
+        if not hasattr(self, "_allocated"):
+            self._allocated = [(s["sh_addr"], s["sh_addr"] + s["sh_size"], s) for s in self.sections
+                               if s["sh_flags"] & 2
+                               and not (s["sh_flags"] & 0x400 and s["sh_type"] == "SHT_NOBITS")]
+        return next((s for low, high, s in self._allocated
+                     if low <= address and address + size <= high), None)
 
     def read(self, address, size):
         section = self.section_at(address, size)

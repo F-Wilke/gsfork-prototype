@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import gtirb
 from iced_x86 import Decoder
 
 from gsfork_elf.elf import Image
@@ -66,6 +67,19 @@ class IntegrationTests(unittest.TestCase):
         self.assertGreater(self.report["validation"]["generated_plt_slots"], 0)
         persisted = json.loads(Path(str(self.output) + ".gsfork/report.json").read_text())
         self.assertEqual(validate_artifact(self.output, persisted), self.report["validation"])
+
+    def test_initializer_aliases_have_elf_symbol_metadata(self):
+        artifacts = Path(str(self.output) + ".gsfork")
+        for name in ("original.gtirb", "rewritten.gtirb"):
+            with self.subTest(ir=name):
+                module = gtirb.IR.load_protobuf(artifacts / name).modules[0]
+                info = module.aux_data["elfSymbolInfo"].data
+                self.assertFalse(set(module.symbols) - set(info))
+                for key in ("elfDynamicInit", "elfDynamicFini"):
+                    block = module.aux_data[key].data
+                    self.assertTrue(list(block.references))
+                    for symbol in block.references:
+                        self.assertIn(symbol, info)
 
     def test_exec_and_stripped_pie(self):
         for pie, stripped in ((False, False), (True, True)):

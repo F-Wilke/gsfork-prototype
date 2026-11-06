@@ -43,21 +43,27 @@ class Metadata:
             raise RewriteError(f"{image.path}: no recovered FDEs")
         self.starts = [f["initial_location"] for f in self.frames]
         self.rows = [f.get_decoded().table for f in self.frames]
+        self.row_starts = [[row["pc"] for row in rows] for rows in self.rows]
+        self.states = [{} for _ in self.rows]
         self.sites = []
         for fde in self.frames:
             if fde.lsda_pointer:
                 self.sites.extend(self._lsda(fde))
 
     def state(self, address):
+        """Return the shared unwind state at an address; callers must not mutate it."""
         index = bisect.bisect_right(self.starts, address) - 1
         if index < 0:
             return None
         fde = self.frames[index]
         if address >= fde["initial_location"] + fde["address_range"]:
             return None
-        rows = self.rows[index]
-        row = next((r for r in reversed(rows) if r["pc"] <= address), None)
-        return cfi_state(row) if row else None
+        row = bisect.bisect_right(self.row_starts[index], address) - 1
+        if row < 0:
+            return None
+        if row not in self.states[index]:
+            self.states[index][row] = cfi_state(self.rows[index][row])
+        return self.states[index][row]
 
     def _lsda(self, fde):
         image = self.image

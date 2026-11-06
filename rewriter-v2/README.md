@@ -201,7 +201,8 @@ Reports are correctness evidence, not cryptographically authenticated certificat
 ## Implementation
 
 1. Parse ELF eligibility, dynamic relocations, and available unwind/LSDA data.
-2. Run Ddisasm with default CFI recovery and `-j 1`. Reported recovery errors and
+2. Run Ddisasm with default CFI recovery and `-j N` (see
+   [Rewriter scaling](#rewriter-scaling)). Reported recovery errors and
    warnings fail except narrowly recognized diagnostics whose corresponding IR
    condition is checked: an absent entry point for an entryless ET_DYN shared
    object; relocation of `__ehdr_start` when it is restored as a linker-defined
@@ -458,11 +459,14 @@ nested signal handler, restores scratch, and resumes the partial operation.
 
 ## Validation corpus and performance
 
-`make check` currently runs 26 unittest methods, including:
+`make check` runs the unittest corpus, including:
 
 * Linked C++ ET_EXEC, PIE, and fully stripped PIE without retained static
   relocations; original/native-reassembly/GS=0 execution, constructors/destructors,
   backtraces, exception propagation, cleanup, and landing pads.
+* ELF metadata for generated labels, including aliases at dynamic initializer
+  and finalizer entry points. The pinned printer requires metadata for every
+  alias when selecting a symbol by binding; missing entries can crash it.
 * Versioned shared-library loading with `dlvsym`, preserved SONAME, and real
   constructor/destructor execution.
 * A compiler-generated symbolic relative jump table.
@@ -507,6 +511,113 @@ GS/baseline ratio. `--arg VALUE` supplies a program argument. These timings incl
 process startup and are **not** isolated instruction-overhead measurements.
 Use a runtime-integrated workload for nonzero-GS throughput measurements; the
 older prototype's performance data is not evidence for this new pipeline.
+
+### Rewriter scaling
+
+In the lind-wasm-apps assessment, OpenSSL and Perl rewrites hit the harness's
+3600-second limit and could run for hours, with more than 70 GB of RAM in use
+across concurrent rewrites. Profiling full rewrites showed these causes:
+
+* **Tool timeouts did not fire.** The installed `ddisasm` and `gtirb-pprinter`
+  are Python wrappers that run the real tool as a grandchild, and that grandchild
+  holds the output pipe. `subprocess.run(timeout=...)` killed only the wrapper,
+  then waited for the pipe to close, so recovery ran to completion and kept its
+  memory. Timeouts, and interrupts, now kill the tool's whole process tree.
+  `GSFORK_TOOL_TIMEOUT` sets the per-tool limit in seconds (default 300).
+  Large programs need more: OpenSSL recovery takes about 160 seconds and Perl
+  recovery about 800 seconds. The assessment harness sets the limit to its
+  rewrite timeout. With the default, Perl now fails at 300 seconds; before
+  this fix it failed with the same error, but only after recovery finished.
+* **Single-threaded recovery.** Ddisasm now runs with `-j N`.
+  `GSFORK_DDISASM_THREADS` sets N; the default is the smaller of 8 and the
+  number of available CPUs. The recovered IR does not depend on N:
+  a UUID-free structural digest of the IR was identical for `-j 1` and `-j 16`
+  on minigzip, the zlib example, and OpenSSL (1,111,148 items). OpenSSL
+  recovery took about 500 seconds at `-j 1` and about 150 seconds at `-j 16`.
+* **Report serialization.** `json.dump(..., indent=2)` always uses CPython's
+  pure-Python encoder, which took about 140 seconds per write on OpenSSL, and
+  each successful rewrite writes the report twice. Reports now have one
+  top-level key or one list record per line, each encoded with the C encoder.
+  `json.loads` returns the same value.
+* **ELF parsing.** `Image` decodes symbol tables and relocations with
+  `struct` instead of pyelftools' construct parser. Perl's 274,749 dynamic
+  relocations took 10.4 seconds per parse before and 0.7 seconds after, and
+  each rewrite parses four images. Every attribute matched the old parser on
+  OpenSSL, Perl, minigzip, glibc's `libc.so.6`, and `ld.so`.
+* **Quadratic interval split.** gtirb-rewriting splits every byte interval
+  into one interval per block. After each split it shrinks the remaining
+  interval through `ByteInterval.initialized_size`, which copies all of the
+  remaining bytes. During that split only, the rewriter shrinks the bytearray
+  in place instead. Split, then join, gave identical intervals, blocks, bytes,
+  and symbolic expressions on the Perl and OpenSSL IRs. Splitting took 148 s
+  before and 72 s after on Perl, and 62 s before and 29 s after on OpenSSL.
+* **IR held during printing and validation.** Recovery and instrumentation
+  now run in their own function, which returns only plain report data. After
+  that function returns, the in-memory GTIRB, several GB on large programs, is
+  freed before `gtirb-pprinter`, the linker, and validation run.
+
+Earlier changes still apply:
+
+* Data-block provenance uses GTIRB's indexed, half-open symbolic-expression
+  range lookup.
+* Unwind-state lookup uses binary search.
+* TLS recovery reuses the already verified IR.
+* gtirb-rewriting's expensive whole-block re-disassembly assertion is
+  disabled; the patch offsets come from the checked decoder instead.
+* Generated zero padding is replaced with NOPs directly.
+
+The table shows full rewrites of the assessed inputs in the
+`cranky_keldysh` container, run one or two at a time on a 32-core host,
+without a profiler unless noted. "Python peak" is the rewriter process's
+maximum RSS. The child tool's peak is listed separately.
+
+| Input | Before | After |
+|---|---:|---:|
+| OpenSSL total | 3600 s timeout in the assessment; 1542 s for the earlier draft, profiled | 482 s |
+| OpenSSL Ddisasm | 535 s (`-j 1`) | 156 s (`-j 8`), 5.2 GB |
+| OpenSSL gtirb-rewriting stage | 563 s, profiled | 169 s |
+| OpenSSL Python RSS while printing and linking | 7.2 GB | 2.6 GB |
+| Perl total | 3600 s timeout; recovery alone ran for more than 20 minutes at `-j 1` | 1255 s |
+| Perl Ddisasm | more than 1200 s, killed (`-j 1`) | 796 s (`-j 8`), 7.2 GB |
+| Perl Python peak, while saving the IR | 10.6 GB | 10.6 GB |
+| Perl Python RSS while printing and linking | 10.6 GB | 3.5 GB |
+
+Both programs still stop at final validation. The cause is the separate
+compatibility failure listed in the assessment (`GOT reference does not
+resolve to OPT_HELP_STR` and `... PL_sv_immortals`), not a time or memory
+limit.
+
+The final linked bytes were already not reproducible before these changes.
+gtirb-pprinter orders same-address symbols and sections by UUID, so two
+`-j 1` runs of the same code produced different binaries. The emitted
+assembly, compared as a sorted multiset of lines with generated `__gsfork_*`
+counters normalized, was identical (48,199 lines) across the earlier draft,
+two `-j 1` runs, and the final `-j 8` code for minigzip. minigzip and the zlib
+example rewrite and pass `validate`.
+
+`tests/test_scaling.py` covers:
+
+* indexed lookup and CFI boundaries;
+* TLS IR reuse;
+* padding;
+* the process-tree timeout, using a wrapper-style grandchild;
+* `GSFORK_DDISASM_THREADS` parsing;
+* report round-tripping;
+* fast ELF decoding against pyelftools;
+* the scoped linear interval split against upstream.
+
+The container's suite passes 52 of 55 tests. The three
+`invalid or truncated x86-64 instruction at 0x1035` errors in PLT fixtures
+also occur at the committed `HEAD`, which fails 8 of 41.
+
+Remaining costs:
+
+* Ddisasm's Datalog analysis, at about 5 GB for OpenSSL and 7 GB for Perl.
+* gtirb-rewriting's per-block object bookkeeping, at about 10 GB of Python
+  heap for Perl.
+
+A harness running 8 large rewrites at once should plan for roughly 10 GB per
+worker, or run fewer workers.
 
 ## glibc 2.35 target status
 

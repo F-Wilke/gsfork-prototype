@@ -9,7 +9,7 @@ from gtirb_layout import layout_module
 
 from gsfork_elf.errors import RewriteError
 from gsfork_elf.pipeline import run
-from gsfork_elf.symbols import preserve_integral_symbols
+from gsfork_elf.symbols import complete_elf_symbol_info, preserve_integral_symbols
 
 
 class SymbolLayoutTests(unittest.TestCase):
@@ -27,6 +27,22 @@ class SymbolLayoutTests(unittest.TestCase):
         self.module.aux_data["elfSymbolInfo"].data[symbol] = (
             0, "OBJECT", "LOCAL", "DEFAULT", section_index)
         return symbol
+
+    def test_generated_labels_get_metadata_without_changing_existing_symbols(self):
+        existing = self.symbol("exported", 0x1000, 1)
+        original_info = self.module.aux_data["elfSymbolInfo"].data[existing]
+        labels = [
+            gtirb.Symbol("__gsfork_begin", payload=self.block, module=self.module),
+            gtirb.Symbol("__gsfork_end", payload=self.block, at_end=True, module=self.module),
+        ]
+        complete_elf_symbol_info(self.module)
+        complete_elf_symbol_info(self.module)
+        info = self.module.aux_data["elfSymbolInfo"].data
+        self.assertEqual(info[existing], original_info)
+        for label in labels:
+            self.assertEqual(info[label], (0, "NOTYPE", "LOCAL", "DEFAULT", 0))
+            self.assertIs(label.referent, self.block)
+        self.assertTrue(labels[1].at_end)
 
     def test_constants_do_not_bind_to_synthetic_layout_addresses(self):
         absolute = self.symbol("absolute", 0x1000, 0xFFF1)
@@ -73,7 +89,7 @@ class SymbolLayoutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             log = Path(temporary) / "printer.log"
             result = subprocess.CompletedProcess(["gtirb-pprinter"], 0, warning)
-            with patch("gsfork_elf.pipeline.subprocess.run", return_value=result):
+            with patch("gsfork_elf.pipeline.execute", return_value=result):
                 with self.assertRaisesRegex(RewriteError, "overlapping element"):
                     run(["gtirb-pprinter"], log)
             self.assertIn(warning, log.read_text())
