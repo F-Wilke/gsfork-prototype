@@ -1,5 +1,7 @@
+import ctypes
 import gc
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -8,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from collections import defaultdict
 from dataclasses import asdict
 from contextlib import contextmanager
@@ -38,7 +41,23 @@ GENERATED_DATA = {
 }
 
 
+# The pip entry points for these tools are Python wrappers that only re-run the
+# bundled executable with the same arguments. Running that executable directly
+# keeps the tool a direct child, so PR_SET_PDEATHSIG and timeouts reach it.
+_BUNDLED = {"ddisasm": ("ddisasm", "ddisasm_path"), "gtirb-pprinter": ("gtirb_pprinter", "pprinter_path")}
+
+
 def tool(name):
+    if name in _BUNDLED:
+        package, accessor = _BUNDLED[name]
+        try:
+            locate = getattr(importlib.import_module(package), accessor)
+        except (ImportError, AttributeError):
+            locate = None
+        if locate is not None:
+            with locate() as path:
+                if Path(path).is_file() and os.access(path, os.X_OK):
+                    return str(path)
     sibling = Path(sys.executable).parent / name
     value = str(sibling) if sibling.exists() else shutil.which(name)
     if not value:
@@ -53,7 +72,7 @@ def recovery_threads():
         if not value.isdigit() or int(value) < 1:
             raise RewriteError(f"GSFORK_DDISASM_THREADS must be a positive integer, not {value!r}")
         return int(value)
-    return max(1, min(8, len(os.sched_getaffinity(0))))
+    return len(os.sched_getaffinity(0))
 
 
 def _descendants(pid):
@@ -74,10 +93,34 @@ def _descendants(pid):
     return found
 
 
+class ToolMemoryExceeded(subprocess.SubprocessError):
+    pass
+
+
+def tool_memory_limit():
+    """Optional resident-memory budget in MiB for one external tool and its children."""
+    value = os.environ.get("GSFORK_TOOL_MEMORY")
+    if not value:
+        return None
+    if not value.isdigit() or int(value) < 1:
+        raise RewriteError(f"GSFORK_TOOL_MEMORY must be a positive number of MiB, not {value!r}")
+    return int(value)
+
+
+def _resident_mib(pids):
+    total = 0
+    for pid in pids:
+        try:
+            for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    total += int(line.split()[1])
+                    break
+        except (OSError, ValueError):
+            pass
+    return total // 1024
+
+
 def _kill_tree(process):
-    # The installed ddisasm/gtirb-pprinter entry points are Python wrappers that
-    # run the real tool as a grandchild holding our output pipe. Killing only
-    # the wrapper leaves that tool running and communicate() waiting for it.
     for pid in [process.pid] + _descendants(process.pid):
         try:
             os.kill(pid, signal.SIGKILL)
@@ -85,10 +128,31 @@ def _kill_tree(process):
             pass
 
 
-def execute(command, timeout):
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+def _die_with_parent():
+    # Runs in the child before exec: if the rewriter is killed outright (for
+    # example SIGKILL from a harness timeout), the kernel kills the tool too,
+    # instead of leaving a multi-gigabyte analysis running as an orphan.
+    ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+
+
+def execute(command, timeout, memory_limit=None):
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                               preexec_fn=_die_with_parent)
+    deadline = time.monotonic() + timeout
     try:
-        stdout, _ = process.communicate(timeout=timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                stdout, _ = process.communicate(timeout=min(remaining, 2))
+                break
+            except subprocess.TimeoutExpired:
+                if memory_limit is not None:
+                    used = _resident_mib([process.pid] + _descendants(process.pid))
+                    if used > memory_limit:
+                        raise ToolMemoryExceeded(
+                            f"resident memory {used} MiB exceeded GSFORK_TOOL_MEMORY={memory_limit} MiB") from None
     except BaseException:
         _kill_tree(process)
         process.communicate()
@@ -99,8 +163,8 @@ def execute(command, timeout):
 def run(command, log, *, allow_absent_entry=False, repair_header_symbol=False, local_ifunc_names=(),
         recovery_image=None):
     try:
-        result = execute(command, int(os.environ.get("GSFORK_TOOL_TIMEOUT", "300")))
-    except (OSError, subprocess.TimeoutExpired) as error:
+        result = execute(command, int(os.environ.get("GSFORK_TOOL_TIMEOUT", "300")), tool_memory_limit())
+    except (OSError, subprocess.TimeoutExpired, ToolMemoryExceeded) as error:
         raise RewriteError(f"tool execution failed: {command[0]}: {error}") from error
     Path(log).write_text("COMMAND: " + repr(command) + "\n" + result.stdout)
     diagnostics = result.stdout

@@ -13,8 +13,8 @@ import gtirb
 
 from gsfork_elf.errors import RewriteError
 from gsfork_elf.metadata import Metadata
-from gsfork_elf.pipeline import (Transform, execute, linear_interval_split, normalize_padding, recovery_threads, run,
-                                 write_report)
+from gsfork_elf.pipeline import (ToolMemoryExceeded, Transform, execute, linear_interval_split, normalize_padding,
+                                 recovery_threads, run, tool, tool_memory_limit, write_report)
 from gsfork_elf.policy import Runtime
 
 
@@ -165,7 +165,7 @@ class ScalingTests(unittest.TestCase):
                     recovery_threads()
         with patch.dict(os.environ):
             os.environ.pop("GSFORK_DDISASM_THREADS", None)
-            self.assertTrue(1 <= recovery_threads() <= 8)
+            self.assertEqual(recovery_threads(), len(os.sched_getaffinity(0)))
 
     def test_report_writer_round_trips(self):
         report = {"input": "a\u00e9\"b", "empty": [], "records": [{"address": 1, "kind": ["x", None]}, 2.5],
@@ -239,6 +239,54 @@ class ScalingTests(unittest.TestCase):
         alias = interval.contents
         interval.initialized_size = 2
         self.assertEqual(bytes(alias), b"abcd")
+
+    def _wait_gone(self, pid):
+        for _ in range(200):
+            try:
+                stat = Path(f"/proc/{pid}/stat").read_text()
+            except OSError:
+                return True
+            if stat[stat.rindex(")") + 2] == "Z":
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_tool_memory_budget_kills_tool(self):
+        hog = "import time; data = bytearray(400 << 20); time.sleep(60)"
+        started = time.monotonic()
+        with self.assertRaisesRegex(ToolMemoryExceeded, "GSFORK_TOOL_MEMORY=100 MiB"):
+            execute([sys.executable, "-c", hog], 60, memory_limit=100)
+        self.assertLess(time.monotonic() - started, 20)
+        with patch.dict(os.environ, {"GSFORK_TOOL_MEMORY": "2048"}):
+            self.assertEqual(tool_memory_limit(), 2048)
+        for value in ("0", "8G", "-5"):
+            with patch.dict(os.environ, {"GSFORK_TOOL_MEMORY": value}):
+                with self.assertRaisesRegex(RewriteError, "GSFORK_TOOL_MEMORY"):
+                    tool_memory_limit()
+
+    def test_tool_dies_when_rewriter_is_killed(self):
+        # A harness timeout SIGKILLs the rewriter itself; its tool must not
+        # survive as an orphan.
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "pid"
+            rewriter = ("import sys; sys.path.insert(0, sys.argv[2]); from gsfork_elf.pipeline import execute; "
+                        "execute(['sh', '-c', 'echo $$ > ' + sys.argv[1] + '; exec sleep 60'], 60)")
+            process = subprocess.Popen([sys.executable, "-c", rewriter, str(marker),
+                                        str(Path(__file__).resolve().parents[1])])
+            for _ in range(200):
+                if marker.exists() and marker.read_text().strip():
+                    break
+                time.sleep(0.05)
+            tool_pid = int(marker.read_text())
+            process.kill()
+            process.wait()
+            self.assertTrue(self._wait_gone(tool_pid), "tool survived its killed parent")
+
+    def test_bundled_tools_run_without_python_wrapper(self):
+        for name in ("ddisasm", "gtirb-pprinter"):
+            path = tool(name)
+            with open(path, "rb") as stream:
+                self.assertEqual(stream.read(4), b"\x7fELF", f"{name} resolved to wrapper {path}")
 
 
 if __name__ == "__main__":

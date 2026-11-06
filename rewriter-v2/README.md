@@ -529,11 +529,14 @@ across concurrent rewrites. Profiling full rewrites showed these causes:
   rewrite timeout. With the default, Perl now fails at 300 seconds; before
   this fix it failed with the same error, but only after recovery finished.
 * **Single-threaded recovery.** Ddisasm now runs with `-j N`.
-  `GSFORK_DDISASM_THREADS` sets N; the default is the smaller of 8 and the
-  number of available CPUs. The recovered IR does not depend on N:
+  `GSFORK_DDISASM_THREADS` sets N; the default is every CPU available to the
+  process (`os.sched_getaffinity`, as `nproc` reports). The recovered IR does
+  not depend on N:
   a UUID-free structural digest of the IR was identical for `-j 1` and `-j 16`
-  on minigzip, the zlib example, and OpenSSL (1,111,148 items). OpenSSL
-  recovery took about 500 seconds at `-j 1` and about 150 seconds at `-j 16`.
+  on minigzip, the zlib example, and OpenSSL (1,111,148 items). Nor does peak
+  memory: OpenSSL recovery peaked at 5.22 GB with `-j 1` and 5.31 GB with
+  `-j 8`, taking 517 and 178 seconds. Perl took 796 seconds at `-j 8` and
+  608 seconds at `-j 16`. Lower N only when several rewrites share the CPUs.
 * **Report serialization.** `json.dump(..., indent=2)` always uses CPython's
   pure-Python encoder, which took about 140 seconds per write on OpenSSL, and
   each successful rewrite writes the report twice. Reports now have one
@@ -606,7 +609,7 @@ example rewrite and pass `validate`.
 * fast ELF decoding against pyelftools;
 * the scoped linear interval split against upstream.
 
-The container's suite passes 52 of 55 tests. The three
+The container's suite passes 55 of 58 tests. The three
 `invalid or truncated x86-64 instruction at 0x1035` errors in PLT fixtures
 also occur at the committed `HEAD`, which fails 8 of 41.
 
@@ -618,6 +621,25 @@ Remaining costs:
 
 A harness running 8 large rewrites at once should plan for roughly 10 GB per
 worker, or run fewer workers.
+
+GCC's `cc1` (GCC 15.2.0, 27.8 MB of `.text`, about 10 times Perl's) is
+beyond what this pipeline can handle on a 123 GB host. Ddisasm alone was
+still in its first Datalog pass after 44 minutes at `-j 8`, at 85 GB and still
+growing, when it was stopped; none of the rewriter's own stages had started.
+Perl's gtirb-rewriting stage needed 10 GB for 2.8 MB of `.text`, so `cc1`
+would need on the order of 100 GB more after recovery. The gcc driver itself
+(0.9 MB of `.text`) is unaffected.
+
+To keep such inputs from hogging a shared host:
+
+* Every external tool is killed if the rewriter dies, including by SIGKILL
+  from a harness timeout (`PR_SET_PDEATHSIG`). The bundled `ddisasm` and
+  `gtirb-pprinter` executables run directly rather than through their pip
+  Python wrappers, so the tool is the rewriter's direct child.
+* `GSFORK_TOOL_MEMORY=<MiB>` optionally limits the resident memory of each
+  tool and its children; exceeding it kills the tool and fails the rewrite.
+  It is checked every 2 seconds.
+* `lind-wasm-apps/mpk/assess.py` kills the whole process group on timeout.
 
 ## glibc 2.35 target status
 
