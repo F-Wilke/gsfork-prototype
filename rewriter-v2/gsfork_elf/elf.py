@@ -102,6 +102,7 @@ class Image:
                         fail(path, "PT_LOAD", cursor, "nonzero executable bytes outside code sections")
                     cursor = hi
         self.symbol_addresses = defaultdict(set)
+        self.symbol_bindings = defaultdict(set)
         self.ifuncs = []
         self.local_ifunc_names = set()
         self.local_tls_names = set()
@@ -138,6 +139,7 @@ class Image:
                             self.local_tls_names.add(symbol.name)
                     if symbol.shndx != "SHN_UNDEF" and symbol.name:
                         self.symbol_addresses[symbol.name].add(symbol.value)
+                        self.symbol_bindings[symbol.name].add((section_index, index, symbol.bind))
                     if section.name == ".dynsym" and symbol.name:
                         self.dynamic_symbols.append((symbol.name, symbol.type))
                         if symbol.shndx == "SHN_UNDEF" and symbol.bind == "STB_GLOBAL":
@@ -164,6 +166,9 @@ class Image:
                         self.function_ranges.append((symbol.name, symbol.value, symbol.size))
         self.symbols = {name: next(iter(addresses)) for name, addresses in self.symbol_addresses.items()
                         if len(addresses) == 1}
+        # Names defined by exactly one symbol-table entry, which is LOCAL.
+        self.unique_local_names = {name for name, entries in self.symbol_bindings.items()
+                                   if len(entries) == 1 and next(iter(entries))[2] == "STB_LOCAL"}
         executable_ranges = [(s["sh_addr"], s["sh_addr"] + s["sh_size"]) for s in self.executable]
         for name, address, _ in self.ifuncs:
             if not any(low <= address < high for low, high in executable_ranges):
@@ -292,3 +297,25 @@ def tcb_field_offset(path, struct, field):
                         raise RewriteError(f"{path}: {struct}.{field} has no constant offset")
                     return location.value
     raise RewriteError(f"{path}: struct {struct} member {field} not found in DWARF")
+
+
+GNU_PROPERTY_X86_FEATURE_1_AND = 0xC0000002
+GNU_PROPERTY_X86_FEATURE_1_IBT = 1
+
+
+def x86_feature_properties(data):
+    """Yield (offset, value) of each X86_FEATURE_1_AND word in .note.gnu.property bytes."""
+    position = 0
+    while position + 12 <= len(data):
+        namesz, descsz, kind = struct.unpack_from("<III", data, position)
+        name_at = position + 12
+        desc_at = name_at + (namesz + 3 & ~3)
+        end = desc_at + (descsz + 7 & ~7)
+        if kind == 5 and bytes(data[name_at:name_at + namesz]) == b"GNU\0":
+            cursor = desc_at
+            while cursor + 8 <= desc_at + descsz:
+                pr_type, pr_size = struct.unpack_from("<II", data, cursor)
+                if pr_type == GNU_PROPERTY_X86_FEATURE_1_AND and pr_size == 4:
+                    yield cursor + 8, struct.unpack_from("<I", data, cursor + 8)[0]
+                cursor += 8 + (pr_size + 7 & ~7)
+        position = end

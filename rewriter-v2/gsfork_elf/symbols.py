@@ -63,8 +63,56 @@ def _shift_layout_clear_of(module, constants):
         interval.address += shift
 
 
+# Names gtirb-pprinter's Intel syntax silently suffixes with "_renamed"
+# (Syntax::sanitizeSymbolName): registers/keywords and hex-literal look-alikes.
+_PRINTER_RESERVED = frozenset(
+    "al ah bl bh cl ch dl dh spl bpl sil dil ax bx cx dx sp bp si di "
+    "eax ebx ecx edx esp ebp esi edi rax rbx rcx rdx rsp rbp rsi rdi rip "
+    "fs ss mod not and or shr".split()
+    + [f"r{n}{s}" for n in range(8, 16) for s in ("", "b", "w", "d")])
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def printer_renames(name):
+    """Whether gtirb-pprinter's Intel syntax would print name as name_renamed."""
+    if name.lower() in _PRINTER_RESERVED:
+        return True
+    body = name
+    if len(name) > 2 and name[:2] in ("0x", "0X"):
+        body = name[2:]
+    elif len(name) > 1 and name[-1] in "hH":
+        body = name[:-1]
+    return bool(body) and all(c in _HEX_DIGITS for c in body)
+
+
+def printer_name_restorations(module, executable):
+    """Split non-local printer-renamed names into (quoted, aliased) for gsfork-cc.
+
+    Call after uniquify_locals, which already renames every such local.
+    """
+    names = {symbol.name for symbol in module.symbols}
+    quoted, aliased = set(), set()
+    for symbol in module.symbols:
+        if not printer_renames(symbol.name):
+            continue
+        if symbol.name + "_renamed" in names:
+            raise RewriteError(f"symbol {symbol.name} collides with printer name {symbol.name}_renamed")
+        if symbol.name.lower() not in _PRINTER_RESERVED:
+            quoted.add(symbol.name)
+        elif executable and isinstance(symbol.referent, (gtirb.CodeBlock, gtirb.DataBlock)):
+            aliased.add(symbol.name)
+        else:
+            raise RewriteError(f"non-local symbol {symbol.name} is an assembler register/keyword name; "
+                               "only executable definitions can be preserved")
+    return sorted(quoted), sorted(aliased)
+
+
 def uniquify_locals(module):
-    """Keep symbol objects/aux-data keys intact while disambiguating assembler names."""
+    """Keep symbol objects/aux-data keys intact while disambiguating assembler names.
+
+    Also renames locals the printer would otherwise rename on its own, so the
+    provenance report names exactly the symbols that appear in the output.
+    """
     groups = defaultdict(list)
     for symbol in module.symbols:
         groups[symbol.name].append(symbol)
@@ -73,7 +121,7 @@ def uniquify_locals(module):
     occupied = set(groups)
     renames = []
     for name, group in sorted(groups.items()):
-        if not name or len(group) < 2:
+        if not name or (len(group) < 2 and not printer_renames(name)):
             continue
         for symbol in sorted(group, key=lambda s: (sorted(indices.get(s, ())), str(s.uuid))):
             if info[symbol][2] != "LOCAL":

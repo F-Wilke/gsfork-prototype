@@ -2,7 +2,7 @@ import hashlib
 
 from iced_x86 import MemorySizeExt, Mnemonic, OpKind, Register
 
-from .elf import Image
+from .elf import GNU_PROPERTY_X86_FEATURE_1_IBT, Image, x86_feature_properties
 from .errors import RewriteError, fail
 from .metadata import Metadata
 from .plt import patch_plt, pointer_identity, validate_plt
@@ -33,6 +33,7 @@ def shape(ins, symbolic):
         mnemonic = comparisons[mnemonic]
         count -= 1
     compare = mnemonic in comparisons.values()
+    fields = {e["field"] for e in (symbolic if isinstance(symbolic, list) else [symbolic]) if e}
     operands = []
     for index in range(count):
         kind = ins.op_kind(index)
@@ -43,10 +44,10 @@ def shape(ins, symbolic):
         elif kind == OpKind.MEMORY:
             operands.append(("memory", ins.memory_base, ins.memory_index, ins.memory_index_scale,
                              MemorySizeExt.size(ins.memory_size) if compare else ins.memory_size,
-                             None if symbolic and symbolic["field"] == "displacement"
+                             None if "displacement" in fields
                              else ins.memory_displacement))
         elif kind >= OpKind.IMMEDIATE8 and kind <= OpKind.IMMEDIATE32TO64:
-            operands.append(("immediate", None if symbolic and symbolic["field"] == "immediate"
+            operands.append(("immediate", None if "immediate" in fields
                              else ins.immediate(index)))
         else:
             operands.append(("implicit", kind))
@@ -88,7 +89,7 @@ def tls_bias(image, ins, expr):
 def encoded_target(ins, expr):
     if expr["field"] == "displacement":
         target = ins.ip_rel_memory_address if ins.is_ip_rel_memory_operand else ins.memory_displacement
-    elif ins.is_ip_rel_memory_operand:
+    elif ins.is_ip_rel_memory_operand and expr["field"] != "immediate":
         raise RewriteError("RIP-relative displacement has no symbolic expression")
     elif any(ins.op_kind(n) in BRANCH_KINDS for n in range(ins.op_count)):
         target = ins.near_branch_target
@@ -129,9 +130,13 @@ def check_reference(image, ins, expr, plt_entries):
         reloc = image.relocations.get(target)
         resolver_match = (reloc and reloc["type"] == 37 and expr.get("ifunc_resolver") is not None
                           and reloc["addend"] == image.symbol(expr["ifunc_resolver"]))
-        if not reloc or (reloc["symbol"] != expr["symbol"] and not resolver_match) or expr["offset"]:
+        # A non-preemptible definition gets a RELATIVE GOT slot holding its address.
+        local_match = (reloc and reloc["type"] == 8 and not reloc["symbol"] and not expr.get("version")
+                       and reloc["addend"] == image.symbol(expr.get("value_symbol", expr["symbol"])))
+        if (not reloc or (reloc["symbol"] != expr["symbol"] and not resolver_match and not local_match)
+                or expr["offset"]):
             raise RewriteError(f"GOT reference does not resolve to {expr['symbol']}")
-        if not resolver_match and "version" in expr and reloc["version"] != expr["version"]:
+        if not (resolver_match or local_match) and "version" in expr and reloc["version"] != expr["version"]:
             raise RewriteError(f"GOT symbol version changed for {expr['symbol']}")
     elif attributes == ["GOT", "TPOFF"]:
         relocation = image.relocations.get(target)
@@ -146,7 +151,8 @@ def check_reference(image, ins, expr, plt_entries):
             raise RewriteError("local TLS GOT reference changed")
     elif (target - value(image, expr)) & ((1 << 64) - 1):
         raise RewriteError(f"stale symbolic reference to {expr['symbol']}: got 0x{target:x}")
-    if ins.is_ip_rel_memory_operand and ins.mnemonic != Mnemonic.LEA and image.section_at(target) is None:
+    if (ins.is_ip_rel_memory_operand and expr["field"] == "displacement" and ins.mnemonic != Mnemonic.LEA
+            and image.section_at(target) is None):
         if (expr["symbol"] != "__ehdr_start" or image.symbol("__ehdr_start") != 0
                 or not 0 <= target < image.elf["e_ehsize"]):
             raise RewriteError(f"RIP-relative reference leaves allocated image: 0x{target:x}")
@@ -261,6 +267,7 @@ def validate_artifact(path, report):
     old_starts, old_ends = {}, {}
     final_records, wrappers, direct, leave_wrappers = [], [], [], []
     instruction_count = 0
+    notrack_dropped = False
     for block in report["blocks"]:
         begin, end = image.symbol(block["begin"]), image.symbol(block["end"])
         section = image.section_at(begin, max(end - begin, 1))
@@ -324,12 +331,22 @@ def validate_artifact(path, report):
                             raise RewriteError(f"instruction rule changed from {expected} to {rule}")
                     elif block["trusted"] and block["section"] not in report["trusted_sections"]:
                         raise RewriteError("instruction marked trusted outside declared boundary")
-                    if shape(original, item["expression"]) != shape(ins, item["expression"]):
+                    expressions = [item["expression"], *item.get("extra_expressions", ())]
+                    before, after = shape(original, expressions), shape(ins, expressions)
+                    if item.get("notrack_dropped"):
+                        # NOTRACK (DS) became GS; the output must also stop advertising IBT.
+                        if (baseline or original.segment_prefix != Register.DS
+                                or ins.segment_prefix != Register.GS or not before[5]):
+                            raise RewriteError("invalid NOTRACK-to-GS branch conversion")
+                        before = before[:5] + (False,) + before[6:]
+                        notrack_dropped = True
+                    if before != after:
                         raise RewriteError(f"instruction semantics changed: {original} -> {ins}")
                     if (baseline and original.mnemonic != Mnemonic.NOP
                             and original.segment_prefix != ins.segment_prefix):
                         raise RewriteError("native baseline changed a segment override")
-                    check_reference(image, ins, item["expression"], plt_entries)
+                    for expression in expressions:
+                        check_reference(image, ins, expression, plt_entries)
                 for instruction in sequence:
                     boundaries.update((instruction.ip, instruction.next_ip))
                     starts.add(instruction.ip)
@@ -454,6 +471,8 @@ def validate_artifact(path, report):
             raise RewriteError(f"{path}: function symbol {name} has stale code boundaries")
     mapped_sites = []
     def map_action(action):
+        if isinstance(action, list):
+            return [action[0], [map_action(a) for a in action[1]]]
         if not isinstance(action, int) or action == 0:
             return action
         for record in report["data"]:
@@ -477,6 +496,11 @@ def validate_artifact(path, report):
     metadata_summary = final_metadata.validate(boundaries, starts)
     if hashlib.sha256(image.data).hexdigest() != report["output_sha256"]:
         raise RewriteError(f"{path}: artifact hash does not match provenance report")
+    if notrack_dropped:
+        note = image.elf.get_section_by_name(".note.gnu.property")
+        if note is not None and any(features & GNU_PROPERTY_X86_FEATURE_1_IBT
+                                    for _, features in x86_feature_properties(note.data())):
+            raise RewriteError(f"{path}: NOTRACK was dropped but the output still advertises IBT")
     report["locations"] = final_records
     report["wrappers"] = wrappers
     report["leave_wrappers"] = leave_wrappers

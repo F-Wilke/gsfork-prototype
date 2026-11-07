@@ -244,7 +244,14 @@ Reports are correctness evidence, not cryptographically authenticated certificat
    AT&T suffixes on FSGSBASE instructions. The compiler adapter corrects the
    pinned printer's RSTORSSP operand-width and negative XABORT-immediate syntax,
    and ensures init/fini resolve to explicit original-entry aliases rather than
-   an arbitrary at-end marker. Final instruction equivalence is checked after
+   an arbitrary at-end marker. The printer renames symbols that look like
+   registers, keywords, or hex literals (`BC`, `d`, `ah`) to `NAME_renamed`:
+   local ones are uniquified before printing, non-local hex-like names are
+   restored as quoted names, and non-local register/keyword names defined in an
+   executable are restored as `.set` aliases with the same linkage, type, and
+   size (other cases are rejected). Instructions the printer's Capstone cannot
+   render (SHA1MSG2) are emitted between `__gsfork_raw_N_<hex>` labels and
+   restored to their exact bytes by the adapter. Final instruction equivalence is checked after
    these corrections. GNU assembly regenerates CFI encodings; the link
    requests `--eh-frame-hdr`, eager binding, and retained local symbols.
 8. Apply the bounded PLT strategy below, then validate the actual ELF.
@@ -385,6 +392,7 @@ The exact mnemonic allowlist and form checks are in
 | Existing FS memory | Preserve the runtime TLS contract |
 | Near direct/register-indirect control flow | Preserve; relocate direct references |
 | Register-indirect NOTRACK CALL/JMP | Preserve the DS/NOTRACK control prefix |
+| Memory-indirect NOTRACK CALL/JMP | Replace the DS/NOTRACK prefix byte with GS in place (a second prefix would leave DS effective); the output's `.note.gnu.property` stops advertising IBT, SHSTK is kept |
 | Ordinary 64-bit PUSH/POP/CALL/RET, PUSHFQ/POPFQ | Native implicit stack alias |
 | 64-bit LEAVE | Native by default; parent-stack mode spills RAX to FS scratch, computes RSP with LEA, restores RAX, then POPs RBP (flags preserved) |
 | 64-bit-address MOVS/STOS, byte/word/dword/qword, with or without REP | Dedicated family-specific FS-scratch wrapper |
@@ -396,6 +404,25 @@ LODS, string CMPS/SCAS, address-size-overridden strings, far transfers, ENTER,
 nonstandard stack forms, and instructions absent from the explicit allowlist
 remain unsupported. The SIMD CMPSD instruction is distinct from string CMPSD.
 Supporting one string family does not permit another.
+
+An instruction may carry at most two symbolic fields: one displacement and one
+immediate (non-PIE `mov QWORD PTR [rip+x], OFFSET y`), both without
+attributes and not on a branch; each is validated separately. A GOT reference
+to a non-preemptible definition is accepted when its slot holds an
+`R_X86_64_RELATIVE` relocation whose addend is the expected definition. Ddisasm
+self-forwarding of non-PIE canonical-PLT imports ends symbol-forwarding
+resolution instead of being reported as a cycle. Ddisasm's "Could not find
+GLOBAL/WEAK symbol" warning for a GOT slot is accepted only when the name has a
+single, LOCAL symbol-table definition (its fallback is then the right symbol).
+
+C++ LSDA exception-specification filters (`throw(...)`, clang `noexcept`) are
+parsed into their type-identity lists and validated like catch types. LSDA
+type-table entries Ddisasm leaves as raw bytes (entries reached only through a
+specification) are symbolized as `target - slot` before printing and reported
+as `lsda-type-entry` reference repairs. MOVS/STOS wrappers accept a DWARF CFA or
+register expression (for example the stack-realignment CFA `*(rbp - 8)`) when it
+reads none of the wrapper's temporary registers; unknown expression operations
+are still rejected.
 
 Recovery requires ordinary sectioned ELF and nonoverlapping, complete recovered
 code/data coverage in executable sections. Embedded **non-padding data in an

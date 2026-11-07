@@ -386,6 +386,18 @@ class IntegrationTests(unittest.TestCase):
                 return
         self.fail("fixture did not exercise symbolic-memory immediates")
 
+    def test_exception_specification_filters(self):
+        source = self.work / "exception_spec"
+        command(["g++", "-std=c++03", "-O2", "-fno-omit-frame-pointer",
+                 FIXTURES / "exception_spec.cpp", "-o", source])
+        self.assertTrue(any(isinstance(action, list) for site in Metadata(Image(source)).sites
+                            for action in site["actions"]), "fixture lacks an exception specification")
+        output = self.work / "exception_spec.gs"
+        report = rewrite(source, output, trusted_libraries=TRUST)
+        self.assertGreater(report["validation"]["exception_call_sites"], 0)
+        for binary in (source, Path(str(output) + ".gsfork") / "baseline", output):
+            self.assertEqual(command([binary]).stdout, "exception-spec-ok\n")
+
     def test_validator_rejects_stale_exception_landing_pad(self):
         image = Image(self.output)
         fde = next(f for f in Metadata(image).frames if f.lsda_pointer)

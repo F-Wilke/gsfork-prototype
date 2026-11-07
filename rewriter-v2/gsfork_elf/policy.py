@@ -51,6 +51,16 @@ fmul fadd fldcw faddp fcmovbe fdivp fdivrp wait
 fxsave fxrstor xsave xsavec xrstor xgetbv rdtsc rdtscp
 xbegin xabort xend xtest
 """.split())
+# Register/explicit-memory-only forms found in the lind-wasm-apps workloads:
+# SSE4.1 inserts/extracts, SHA-NI, CRC32, AVX2/AVX-512 integer, and RNG.
+ORDINARY |= set("""
+pinsrd pextrd psubsb crc32 rdrand rdseed
+sha1rnds4 sha1nexte sha1msg1 sha1msg2
+vpextrq vpinsrq vpaddq vpsllq vpsrlq vpunpcklqdq vpermq
+vextracti128 vinserti128
+vbroadcasti32x4 vextracti32x4 vextracti64x4 vmovdqa32
+vpxord vpandd vpternlogq vpclmulqdq vpopcntq
+""".split())
 #X87 floating-point instructions for libm
 ORDINARY |= set("""
     fist fistp fisttp fst ffree ffreep
@@ -228,7 +238,12 @@ def classify(ins, runtime=Runtime(), *, output=False):
         # GNU alignment NOPs conventionally carry an ignored CS override.
         notrack_register = (ins.segment_prefix == Register.DS and name in ("call", "jmp")
                             and ins.op0_kind == OpKind.REGISTER)
-        if not notrack_register and (name != "nop" or ins.segment_prefix != Register.CS):
+        # A memory-indirect NOTRACK branch becomes a GS branch; the transform
+        # drops NOTRACK and IBT together (see pipeline.drop_ibt_property).
+        notrack_memory = (ins.segment_prefix == Register.DS and name in ("call", "jmp")
+                          and ins.op0_kind == OpKind.MEMORY and not output)
+        if (not notrack_register and not notrack_memory
+                and (name != "nop" or ins.segment_prefix != Register.CS)):
             raise RewriteError("unsupported explicit segment override")
     if name in ("lea", "nop"):
         return "logical" if name == "lea" else "padding"

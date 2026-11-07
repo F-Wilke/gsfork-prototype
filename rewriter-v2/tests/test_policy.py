@@ -39,9 +39,13 @@ class PolicyTests(unittest.TestCase):
         for code in ("65488b07", "2e488b07", "f3ac",
                      "f3a6", "f2ae", "67f3a4", "64f3a4", "d7", "c8000000",
                      "66c9", "6650", "6658", "c20800", "0f01f8",
-                     "0f0117", "0fa9", "8ee0", "ff18", "f2ff10", "0f20c0", "3eff10"):
+                     "0f0117", "0fa9", "8ee0", "ff18", "f2ff10", "0f20c0"):
             with self.subTest(code=code), self.assertRaises(RewriteError):
                 self.rule(code)
+        # Memory-indirect NOTRACK is converted to GS (IBT dropped); never valid output.
+        self.assertEqual(self.rule("3eff10"), "gs")
+        with self.assertRaises(RewriteError):
+            self.rule("3eff10", output=True)
 
     def test_scratch_validation(self):
         for runtime in (Runtime(0, None), Runtime(0, 4), Runtime(1 << 32, 16),

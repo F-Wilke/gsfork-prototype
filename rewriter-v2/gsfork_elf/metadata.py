@@ -24,6 +24,52 @@ class Reader:
         raise RewriteError("overlong LEB128 in exception metadata")
 
 
+_FIXED_OPERAND = {0x06: 0, 0x12: 0, 0x1a: 0, 0x1c: 0, 0x1e: 0, 0x22: 0, 0x96: 0,
+                  0x08: 1, 0x09: 1, 0x0a: 2, 0x0b: 2, 0x0c: 4, 0x0d: 4, 0x0e: 8, 0x0f: 8}
+
+
+def expression_registers(expression):
+    """Registers a DWARF expression reads, or None if it uses an unrecognized operation."""
+    data, position, registers = bytes(expression), 0, set()
+
+    def leb():
+        nonlocal position
+        value = shift = 0
+        while position < len(data):
+            byte = data[position]
+            position += 1
+            value |= (byte & 127) << shift
+            shift += 7
+            if not byte & 128:
+                return value
+        raise IndexError
+
+    try:
+        while position < len(data):
+            opcode = data[position]
+            position += 1
+            if opcode in _FIXED_OPERAND:
+                position += _FIXED_OPERAND[opcode]
+            elif opcode in (0x10, 0x11, 0x23) or 0x30 <= opcode <= 0x4f:
+                if opcode < 0x30:
+                    leb()
+            elif 0x50 <= opcode <= 0x8f:
+                registers.add((opcode - 0x50) % 32)
+                if opcode >= 0x70:
+                    leb()
+            elif opcode in (0x90, 0x92):
+                registers.add(leb())
+                if opcode == 0x92:
+                    leb()
+            else:
+                return None
+        if position > len(data):
+            return None
+    except IndexError:
+        return None
+    return registers
+
+
 def cfi_state(row):
     cfa = row["cfa"]
     return {"cfa": [cfa.reg, cfa.offset, cfa.expr],
@@ -46,6 +92,9 @@ class Metadata:
         self.row_starts = [[row["pc"] for row in rows] for rows in self.rows]
         self.states = [{} for _ in self.rows]
         self.sites = []
+        # LSDA type-table slot address -> PC-relative target, for repairing
+        # entries the disassembler left unsymbolized.
+        self.type_slots = {}
         for fde in self.frames:
             if fde.lsda_pointer:
                 self.sites.extend(self._lsda(fde))
@@ -101,24 +150,39 @@ class Metadata:
                 filter_value = ar.leb(signed=True)
                 displacement_address = ar.address
                 next_action = ar.leb(signed=True)
+                if filter_value and type_base is None:
+                    raise RewriteError(f"{image.path}: LSDA action requires a missing type table")
                 if filter_value < 0:
-                    raise RewriteError(f"{image.path}: LSDA exception-specification filters are unsupported")
-                identity = None
-                if filter_value:
-                    if type_base is None:
-                        raise RewriteError(f"{image.path}: LSDA action requires a missing type table")
-                    slot = type_base - filter_value * 4
-                    if not end <= slot < type_base:
-                        raise RewriteError(f"{image.path}: invalid LSDA type index")
-                    delta = int.from_bytes(image.read(slot, 4), "little", signed=True)
-                    identity = image.pointer_identity(slot + delta) if delta else 0
-                actions.append(identity)
+                    # Exception specification: a zero-terminated ULEB128 list of
+                    # type indices at TTBase + (-filter - 1).
+                    spec = Reader(image, type_base - filter_value - 1)
+                    identities = []
+                    while True:
+                        if not spec.address < section["sh_addr"] + section["sh_size"]:
+                            raise RewriteError(f"{image.path}: unterminated LSDA exception specification")
+                        index = spec.leb()
+                        if not index:
+                            break
+                        identities.append(self._type(type_base, end, index))
+                    actions.append(["spec", identities])
+                else:
+                    actions.append(self._type(type_base, end, filter_value) if filter_value else None)
                 current = displacement_address + next_action if next_action else None
             sites.append({"start": start + low, "end": start + low + size,
                           "landing": start + landing if landing else 0, "actions": actions})
         if reader.address != end:
             raise RewriteError(f"{image.path}: LSDA call-site table has a partial record")
         return sites
+
+    def _type(self, type_base, table_start, index):
+        slot = type_base - index * 4
+        if not table_start <= slot < type_base:
+            raise RewriteError(f"{self.image.path}: invalid LSDA type index")
+        delta = int.from_bytes(self.image.read(slot, 4), "little", signed=True)
+        if not delta:
+            return 0
+        self.type_slots[slot] = slot + delta
+        return self.image.pointer_identity(slot + delta)
 
     def validate(self, boundaries, code_starts):
         image = self.image

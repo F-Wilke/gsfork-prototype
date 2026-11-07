@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -21,16 +22,16 @@ import gtirb_rewriting.prepare
 from gtirb_rewriting import Constraints, Pass, PassManager, Patch
 from iced_x86 import Decoder, Mnemonic, OpKind, Register
 
-from .elf import Image
-from .compiler import normalize_assembly
+from .elf import GNU_PROPERTY_X86_FEATURE_1_IBT, Image, x86_feature_properties
+from .compiler import ALIAS_OPTION, QUOTE_OPTION, RAW_END, RAW_LABEL, normalize_assembly
 from .errors import RewriteError, fail
-from .metadata import Metadata
+from .metadata import Metadata, expression_registers
 from .plt import PLT_SECTIONS, patch_plt, pointer_identity
 from .policy import Runtime, classify, decode
 from .recovery import repair_masked_table_bases
-from .validator import tls_bias
+from .validator import BRANCH_KINDS, tls_bias
 from .symbols import (add_reference_aliases, complete_elf_symbol_info, preserve_integral_symbols, preserve_resolved_fs_offsets,
-                      resolver_symbols, restore_linker_symbols,
+                      printer_name_restorations, resolver_symbols, restore_linker_symbols,
                       uniquify_locals, verify_tls)
 
 
@@ -182,9 +183,15 @@ def run(command, log, *, allow_absent_entry=False, repair_header_symbol=False, l
     if repair_header_symbol:
         diagnostics = diagnostics.replace("WARNING: Moving symbol to first block of section: __ehdr_start", "")
     diagnostics = diagnostics.replace("WARNING: Moving symbol to first block of section: __bss_start", "INFO: Moving symbol to first block of section: __bss_start")
-    for name in set(local_ifunc_names) | set(local_tls_names):
-        diagnostic = "WARNING: Could not find GLOBAL/WEAK symbol for "
-        diagnostics = diagnostics.replace(f"{diagnostic}\n{diagnostic}{name}\n", "")
+    # Ddisasm wants a GLOBAL/WEAK destination for each GOT slot and falls back
+    # to the first symbol of that name. That is the right one for a uniquely
+    # named LOCAL definition (a RELATIVE GOT slot, checked again by validation).
+    unambiguous = set(local_ifunc_names) | local_tls_names
+    if recovery_image is not None:
+        unambiguous |= getattr(recovery_image, "unique_local_names", set())
+    missing = "WARNING: Could not find GLOBAL/WEAK symbol for "
+    diagnostics = re.sub(rf"{missing}(?:\n{missing})?(\S+)",
+                         lambda m: "" if m[1] in unambiguous else m[0], diagnostics)
     # gtirb-pprinter echoes the link command; symbol names such as `error`
     # in -Wl,--undefined=... are not diagnostics. Neither are libc's
     # .gnu.warning link notes ("the use of `mktemp' is dangerous ...").
@@ -203,7 +210,9 @@ def expression(expr, module, resolvers):
 
     def resolve(symbol):
         seen = set()
-        while symbol in forward:
+        # Ddisasm forwards a non-PIE canonical-PLT import (an undefined symbol
+        # with a nonzero value) to itself; that is the symbol's own identity.
+        while symbol in forward and forward[symbol].uuid != symbol.uuid:
             if symbol in seen:
                 raise RewriteError("cyclic GTIRB symbol forwarding")
             seen.add(symbol)
@@ -243,6 +252,41 @@ def expression(expr, module, resolvers):
     raise RewriteError(f"unsupported GTIRB symbolic expression {expr}")
 
 
+# Capstone in gtirb-pprinter 2.2.5 prints these as NOP padding; emit raw bytes.
+PRINTER_UNPRINTABLE = {Mnemonic.SHA1MSG2}
+
+_SEGMENT_PREFIXES = {0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65}
+_LEGACY_PREFIXES = _SEGMENT_PREFIXES | {0x66, 0x67, 0xF0, 0xF2, 0xF3}
+
+
+def notrack_prefix_offset(encoding):
+    """Offset of the sole (DS/NOTRACK) segment prefix of an instruction encoding."""
+    offsets = []
+    for offset, byte in enumerate(encoding):
+        if byte not in _LEGACY_PREFIXES:
+            break
+        if byte in _SEGMENT_PREFIXES:
+            offsets.append(offset)
+    if len(offsets) != 1 or encoding[offsets[0]] != 0x3E:
+        raise RewriteError("NOTRACK branch needs exactly one DS segment prefix")
+    return offsets[0]
+
+
+def drop_ibt_property(module):
+    """Stop advertising IBT: NOTRACK, which IBT alone gives meaning to, was dropped.
+
+    SHSTK and other features are kept; the linker ANDs these bits across inputs.
+    """
+    for section in module.sections:
+        if section.name != ".note.gnu.property":
+            continue
+        for interval in section.byte_intervals:
+            data = bytearray(interval.contents)
+            for offset, features in list(x86_feature_properties(data)):
+                struct.pack_into("<I", data, offset, features & ~GNU_PROPERTY_X86_FEATURE_1_IBT)
+            interval.contents = bytes(data)
+
+
 def marker(module, block, number):
     begin, end = f"__gsfork_b_{number}", f"__gsfork_e_{number}"
     gtirb.Symbol(begin, payload=block, module=module)
@@ -258,6 +302,8 @@ class Transform(Pass):
         self.input_data_ids = set()
         self.resolvers = resolvers or {}
         self.tls_bias = None
+        self.notrack_dropped = False
+        self.raw_count = 0
         _, self.plt_slots = patch_plt(image, require_now=False)
 
     def begin_module(self, module, functions, context):
@@ -267,6 +313,7 @@ class Transform(Pass):
         if self.trusted_sections - section_names:
             raise RewriteError(f"trusted sections absent from input: {sorted(self.trusted_sections - section_names)}")
         index = 0
+        prefix_swaps = defaultdict(list)
         for section in sorted(module.sections, key=lambda s: s.address or 0):
             executable = gtirb.Section.Flag.Executable in section.flags
             if not executable and (section.name in GENERATED_DATA
@@ -315,19 +362,25 @@ class Transform(Pass):
                               for off in range(low, low + ins.len)
                               if off in block.byte_interval.symbolic_expressions]
                     exprs = [expression(expr, module, self.resolvers) for off, expr in fields]
-                    if len(exprs) > 1:
-                        fail(self.image.path, section.name, ins.ip, "multiple symbolic instruction fields unsupported")
                     if exprs:
                         decoder = Decoder(64, contents[ins.ip - block.address:ins.next_ip - block.address], ip=ins.ip)
                         decoded = decoder.decode()
                         offsets = decoder.get_constant_offsets(decoded)
-                        location = fields[0][0] - low
-                        if offsets.has_displacement and location == offsets.displacement_offset:
-                            exprs[0]["field"] = "displacement"
-                        elif offsets.has_immediate and location == offsets.immediate_offset:
-                            exprs[0]["field"] = "immediate"
-                        else:
-                            fail(self.image.path, section.name, ins.ip, "symbolic expression not on an encoded field")
+                        for (off, _), expr in zip(fields, exprs):
+                            location = off - low
+                            if offsets.has_displacement and location == offsets.displacement_offset:
+                                expr["field"] = "displacement"
+                            elif offsets.has_immediate and location == offsets.immediate_offset:
+                                expr["field"] = "immediate"
+                            else:
+                                fail(self.image.path, section.name, ins.ip, "symbolic expression not on an encoded field")
+                    # At most one displacement plus one immediate, e.g. non-PIE
+                    # `mov QWORD PTR [rip+x], OFFSET y`; validated field by field.
+                    if len(exprs) > 2 or (len(exprs) == 2 and (
+                            exprs[0]["field"] == exprs[1]["field"]
+                            or any(e["attributes"] for e in exprs)
+                            or any(ins.op_kind(n) in BRANCH_KINDS for n in range(ins.op_count)))):
+                        fail(self.image.path, section.name, ins.ip, "multiple symbolic instruction fields unsupported")
                     relative = ins.is_ip_rel_memory_operand or any(
                         ins.op_kind(n) in (OpKind.NEAR_BRANCH16, OpKind.NEAR_BRANCH32, OpKind.NEAR_BRANCH64)
                         for n in range(ins.op_count))
@@ -351,12 +404,38 @@ class Transform(Pass):
                         ins.ip - block.address:ins.next_ip - block.address].hex(),
                         "rule": rule, "expression": exprs[0] if exprs else None,
                         "unwind": self.metadata.state(ins.ip)}
+                    if len(exprs) > 1:
+                        item["extra_expressions"] = exprs[1:]
                     item["lock_suffix_entry"] = (ins.has_lock_prefix
                                                  and contents[ins.ip - block.address] == 0xF0)
                     record["instructions"].append(item)
+                    if ins.mnemonic in PRINTER_UNPRINTABLE:
+                        if exprs or rule not in ("gs", "native", "trusted", "native-baseline"):
+                            fail(self.image.path, section.name, ins.ip,
+                                 f"{ins}: printer cannot emit this form; raw bytes need a plain operand")
+                        encoding = bytes.fromhex(item["bytes"])
+                        if rule == "gs" and not (self.baseline or record["trusted"]):
+                            encoding = b"\x65" + encoding
+                        # The printer disassembles code bytes itself, so the bytes are
+                        # bracketed by labels and restored verbatim by gsfork-cc.
+                        raw = f"{RAW_LABEL}{self.raw_count}_{encoding.hex()}"
+                        self.raw_count += 1
+                        asm = (f"{raw}:\n.byte " + ",".join(f"0x{b:02x}" for b in encoding)
+                               + f"\n{raw}{RAW_END}:\n"
+                               + self.take_boundary_cfi(module, block, ins, section, "raw-byte instruction"))
+                        context.replace_at(block, ins.ip - block.address, ins.len,
+                                           Patch.from_function(lambda _, asm=asm: asm, Constraints()))
+                        continue
                     if self.baseline or record["trusted"]:
                         continue
-                    if rule == "gs":
+                    if rule == "gs" and ins.segment_prefix == Register.DS:
+                        # Memory-indirect NOTRACK branch: replace the DS/NOTRACK
+                        # prefix byte with GS in place (two segment prefixes would
+                        # leave the effective one to the last, i.e. DS).
+                        prefix = notrack_prefix_offset(contents[ins.ip - block.address:ins.next_ip - block.address])
+                        prefix_swaps[block.byte_interval].append(block.offset + ins.ip - block.address + prefix)
+                        item["notrack_dropped"] = True
+                    elif rule == "gs":
                         # The assembler's `gs` prefix is a code fragment, not a DataBlock.
                         # Inserting it preserves the original symbolic operand and CFI.
                         context.insert_at(block, ins.ip - block.address,
@@ -371,33 +450,24 @@ class Transform(Pass):
                                           for kind, argument in unwind["registers"].values()):
                             fail(self.image.path, section.name, ins.ip,
                                  "leave expansion needs CFI rules for temporary RAX")
-                        asm = self.runtime.leave()
-                        # Replacing LEAVE removes CFI at the following instruction
-                        # when both share a block. Emit that boundary after POP.
-                        cfi = module.aux_data["cfiDirectives"].data
-                        boundary = gtirb.Offset(block, ins.next_ip - block.address)
-                        if boundary.displacement < block.size:
-                            directives = cfi.get(boundary, [])
-                            for directive, arguments, symbol in directives:
-                                if symbol.int or directive not in {
-                                        ".cfi_def_cfa", ".cfi_def_cfa_register", ".cfi_def_cfa_offset",
-                                        ".cfi_adjust_cfa_offset", ".cfi_offset", ".cfi_rel_offset",
-                                        ".cfi_restore", ".cfi_register", ".cfi_same_value",
-                                        ".cfi_undefined", ".cfi_remember_state", ".cfi_restore_state",
-                                        ".cfi_escape"}:
-                                    fail(self.image.path, section.name, ins.ip,
-                                         "unsupported CFI boundary after leave")
-                                asm += directive + " " + ", ".join(map(str, arguments)) + "\n"
-                            if directives:
-                                del cfi[boundary]
+                        # Emit the following boundary's CFI after POP.
+                        asm = self.runtime.leave() + self.take_boundary_cfi(module, block, ins, section, "leave")
                         context.replace_at(block, ins.ip - block.address, ins.len,
                                            Patch.from_function(lambda _, asm=asm: asm, Constraints()))
                     elif rule in ("rep-movsb", "movs", "stos"):
                         unwind = item["unwind"]
                         temporary_registers = {0, 1, 5} if rule == "stos" else {0, 4, 5}
-                        if unwind and (unwind["cfa"][0] in temporary_registers or unwind["cfa"][2] is not None
+
+                        def reads_temporary(expression):
+                            # e.g. the DRAP stack-realignment CFA `*(rbp - 8)` is safe.
+                            used = expression_registers(expression)
+                            return used is None or bool(used & temporary_registers)
+
+                        if unwind and (unwind["cfa"][0] in temporary_registers
+                                       or unwind["cfa"][2] is not None and reads_temporary(unwind["cfa"][2])
                                        or any(kind == "REGISTER" and argument in temporary_registers
                                               or kind in ("EXPRESSION", "VAL_EXPRESSION")
+                                              and reads_temporary(argument)
                                               for kind, argument in unwind["registers"].values())):
                             fail(self.image.path, section.name, ins.ip,
                                  "string wrapper needs CFI rules for temporary register locations")
@@ -405,6 +475,39 @@ class Transform(Pass):
                         context.replace_at(block, ins.ip - block.address, ins.len,
                                            Patch.from_function(lambda _, asm=asm: asm, Constraints()))
                 self.blocks.append(record)
+        for interval, positions in prefix_swaps.items():
+            data = bytearray(interval.contents)
+            for position in positions:
+                data[position] = 0x65
+            interval.contents = bytes(data)
+        if prefix_swaps:
+            drop_ibt_property(module)
+            self.notrack_dropped = True
+
+    def take_boundary_cfi(self, module, block, ins, section, what):
+        """CFI at the next instruction, moved into a replacement patch.
+
+        Replacing an instruction removes CFI at the following instruction when
+        both share a block, so the patch must emit that boundary itself.
+        """
+        cfi = module.aux_data["cfiDirectives"].data
+        boundary = gtirb.Offset(block, ins.next_ip - block.address)
+        if boundary.displacement >= block.size:
+            return ""
+        directives = cfi.get(boundary, [])
+        asm = ""
+        for directive, arguments, symbol in directives:
+            if symbol.int or directive not in {
+                    ".cfi_def_cfa", ".cfi_def_cfa_register", ".cfi_def_cfa_offset",
+                    ".cfi_adjust_cfa_offset", ".cfi_offset", ".cfi_rel_offset",
+                    ".cfi_restore", ".cfi_register", ".cfi_same_value",
+                    ".cfi_undefined", ".cfi_remember_state", ".cfi_restore_state",
+                    ".cfi_escape"}:
+                fail(self.image.path, section.name, ins.ip, f"unsupported CFI boundary after {what}")
+            asm += directive + " " + ", ".join(map(str, arguments)) + "\n"
+        if directives:
+            del cfi[boundary]
+        return asm
 
     def check_recovery(self, section, blocks):
         source = self.image.elf.get_section_by_name(section.name)
@@ -475,7 +578,7 @@ def normalize_padding(module, transform):
 
 
 def print_ir(ir_path, binary, assembly, log, library_paths, *, image=None, entry_symbol=None,
-             initializers=()):
+             initializers=(), restored_names=((), ())):
     command = [tool("gtirb-pprinter"), str(ir_path), "--policy=complete", "--syntax=intel", "--layout",
                "--use-gcc", tool("gsfork-cc"),
                "--keep-all-functions", "--keep-all-array-sections",
@@ -489,6 +592,9 @@ def print_ir(ir_path, binary, assembly, log, library_paths, *, image=None, entry
         command.append(f"--compiler-args=-Wl,-e,{entry_symbol}")
     for flag, name in initializers:
         command.append(f"--compiler-args=-Wl,-{flag}={name}")
+    quoted, aliased = restored_names
+    command += [f"--compiler-args={QUOTE_OPTION}{name}" for name in quoted]
+    command += [f"--compiler-args={ALIAS_OPTION}{name}" for name in aliased]
     if image is not None and image.elf.get_section_by_name(".plt.sec") is not None:
         command.append("--compiler-args=-Wl,-z,ibtplt")
     if image is not None:
@@ -556,6 +662,43 @@ def workspace(output):
             raise RewriteError(f"{error}\nDiagnostics retained in {diagnostics}") from error
 
 
+def symbolize_lsda_types(module, type_slots):
+    """Symbolize LSDA type-table entries the disassembler left as raw bytes.
+
+    Ddisasm misses entries reached only through exception specifications or
+    some cold-partition LSDAs; a raw PC-relative offset would be stale after
+    relocation. Each 4-byte entry becomes `target - slot`.
+    """
+    anchors = {}
+    for symbol in module.symbols:
+        if isinstance(symbol.referent, gtirb.DataBlock) and not symbol.at_end:
+            anchors.setdefault(symbol.referent, symbol)
+
+    def anchor(address):
+        blocks = list(module.data_blocks_on(address))
+        if len(blocks) != 1:
+            raise RewriteError(f"LSDA type reference 0x{address:x} is not inside one recovered data block")
+        block = blocks[0]
+        if block not in anchors:
+            anchors[block] = gtirb.Symbol(f"__gsfork_lsda_{len(anchors)}", payload=block, module=module)
+        return anchors[block], address - block.address
+
+    repaired = []
+    for slot, target in sorted(type_slots.items()):
+        intervals = list(module.byte_intervals_on(slot))
+        if len(intervals) != 1 or intervals[0].section.name != ".gcc_except_table":
+            raise RewriteError(f"LSDA type slot 0x{slot:x} is not in recovered .gcc_except_table")
+        interval = intervals[0]
+        if slot - interval.address in interval.symbolic_expressions:
+            continue
+        (target_symbol, target_offset), (slot_symbol, slot_offset) = anchor(target), anchor(slot)
+        interval.symbolic_expressions[slot - interval.address] = gtirb.SymAddrAddr(
+            1, target_offset - slot_offset, target_symbol, slot_symbol)
+        module.aux_data["symbolicExpressionSizes"].data[gtirb.Offset(interval, slot - interval.address)] = 4
+        repaired.append({"rule": "lsda-type-entry", "slot": slot, "target": target})
+    return repaired
+
+
 def recover_and_transform(source, work, image, metadata, runtime, trusted_sections, baseline,
                           library_paths):
     """Recover, instrument, and save the IR; return only plain report data.
@@ -584,6 +727,7 @@ def recover_and_transform(source, work, image, metadata, runtime, trusted_sectio
     linker_symbols = restore_linker_symbols(module, image)
     resolvers = resolver_symbols(module, image)
     reference_repairs = repair_masked_table_bases(module)
+    reference_repairs += symbolize_lsda_types(module, metadata.type_slots)
     add_reference_aliases(module)
     entry_symbol = None
     initializers = []
@@ -603,11 +747,13 @@ def recover_and_transform(source, work, image, metadata, runtime, trusted_sectio
         entry = gtirb.Symbol(entry_symbol, payload=module.entry_point, module=module)
         module.aux_data["elfSymbolInfo"].data[entry] = (0, "NOTYPE", "GLOBAL", "HIDDEN", 0)
     complete_elf_symbol_info(module)
+    restored_names = printer_name_restorations(
+        module, any(s["p_type"] == "PT_INTERP" for s in image.elf.iter_segments()))
     ir.save_protobuf(original_ir)
     # Establish a native relinking control before touching instruction semantics.
     print_ir(original_ir, work / "baseline", work / "baseline.S",
              work / "baseline.log", library_paths, image=image, entry_symbol=entry_symbol,
-             initializers=initializers)
+             initializers=initializers, restored_names=restored_names)
     transform = Transform(image, metadata, runtime, trusted_sections, baseline, resolvers)
     with preserve_integral_symbols(module), linear_interval_split():
         # Patch boundaries come from decode() above; avoid re-disassembling
@@ -619,7 +765,7 @@ def recover_and_transform(source, work, image, metadata, runtime, trusted_sectio
     complete_elf_symbol_info(module)
     ir.save_protobuf(work / "rewritten.gtirb")
     return (entry_symbol, initializers, transform, fs_offsets, local_renames, linker_symbols,
-            resolvers, reference_repairs)
+            resolvers, reference_repairs, restored_names)
 
 
 def rewrite(input_path, output_path, *, baseline=False, runtime=Runtime(),
@@ -641,13 +787,14 @@ def rewrite(input_path, output_path, *, baseline=False, runtime=Runtime(),
     patch_plt(image, require_now=False)
     with workspace(output) as work:
         (entry_symbol, initializers, transform, fs_offsets, local_renames, linker_symbols,
-         resolvers, reference_repairs) = recover_and_transform(
+         resolvers, reference_repairs, restored_names) = recover_and_transform(
             source, work, image, metadata, runtime, trusted_sections, baseline, library_paths)
         gc.collect()
         rewritten_ir = work / "rewritten.gtirb"
         staged = work / "output"
         print_ir(rewritten_ir, staged, work / "output.S", work / "link.log", library_paths,
-                 image=image, entry_symbol=entry_symbol, initializers=initializers)
+                 image=image, entry_symbol=entry_symbol, initializers=initializers,
+                 restored_names=restored_names)
         linked = Image(staged)
         generated = []
         if not baseline:
@@ -677,6 +824,7 @@ def rewrite(input_path, output_path, *, baseline=False, runtime=Runtime(),
             "resolved_fs_offsets": fs_offsets,
             "lock_prefix_ordering": lock_orders,
             "reference_repairs": reference_repairs,
+            "ibt_dropped": transform.notrack_dropped,
             "local_symbol_renames": local_renames,
             "linker_symbols": linker_symbols,
             "input_resolvers": [{"original": address, "symbol": name} for address, name in resolvers.items()],
