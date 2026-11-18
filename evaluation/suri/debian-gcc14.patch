@@ -1,0 +1,49 @@
+diff --git a/superSymbolizer/CustomCompiler.py b/superSymbolizer/CustomCompiler.py
+index 27f4a61..4bfcd4b 100644
+--- a/superSymbolizer/CustomCompiler.py
++++ b/superSymbolizer/CustomCompiler.py
+@@ -110,7 +110,7 @@ def emitter(target, reassem_path, output, page_size=0x200000, asan=False, verbos
+ 
+     filename = os.path.basename(target)
+ 
+-    compiler = '/usr/bin/gcc-11'
++    compiler = '/usr/bin/gcc'
+ 
+     lopt = ''
+     if asan:
+@@ -120,7 +120,7 @@ def emitter(target, reassem_path, output, page_size=0x200000, asan=False, verbos
+ 
+         #if opt in ['-lstdc++']:
+         if opt.startswith('libstdc++.so'):
+-            compiler = '/usr/bin/g++-11'
++            compiler = '/usr/bin/g++'
+         #elif opt in ['-lgfortran']:
+         elif opt.startswith('libgfortran.so'):
+             compiler = '/usr/bin/gfortran-11'
+@@ -133,9 +133,9 @@ def emitter(target, reassem_path, output, page_size=0x200000, asan=False, verbos
+     if verbose:
+         print(lopt_list)
+         print(lopt)
+-    #lopt += ' -Wl,--section-start=.interp=%s -Wl,--section-start=.note.ABI-tag=0x1000,--section-start=.my_rodata=%s'%\
++    #lopt += ' -Wl,--section-start=.interp=%s,--section-start=.my_rodata=%s'%\
+     #        (hex(get_next_vaddr(target, page_size)), hex(elf._rodata_base_addr))
+-    lopt += ' -Wl,--section-start=.interp=%s -Wl,--section-start=.note.ABI-tag=0x1000'%\
++    lopt += ' -Wl,--section-start=.interp=%s'%\
+             (hex(get_next_vaddr(target, page_size)))
+     lopt += ' -fcf-protection=full -pie -fPIE'
+     lopt += ' -fcf-protection=full -pie -fPIE'
+diff --git a/superSymbolizer/ElfBricks.py b/superSymbolizer/ElfBricks.py
+index 789502a..1b23a9a 100644
+--- a/superSymbolizer/ElfBricks.py
++++ b/superSymbolizer/ElfBricks.py
+@@ -914,7 +914,9 @@ class ElfBricks:
+ 
+         elfBricks = ElfBricks(target)
+ 
+-        zeros = b'\x00' * (new_base - len(additional_data))
++        pad = max(0, new_base - len(additional_data))
++        pad += (self._offset_range.start - len(additional_data) - pad) % 0x1000
++        zeros = b'\x00' * pad
+         additional_data += zeros
+ 
+         data_start_offset = self._offset_range.start
