@@ -83,6 +83,24 @@ class CompatibilityTests(unittest.TestCase):
                 with self.assertRaisesRegex(RewriteError, "diagnostics"):
                     run(command, log, recovery_image=image)
 
+    def test_data_padding_tie_is_not_a_recovery_diagnostic(self):
+        def tie(address, selected, other):
+            return (f"WARNING: The following block intervals have equal weights (interval scheduling): \n"
+                    f"\t{selected} at {address}, 8 bytes (selected)\n\t{other} at {address}, 8 bytes (not selected)\n\n"
+                    f"\tTo select the other block, re-run ddisasm with hints, e.g.:\n"
+                    f"\t$ printf 'disassembly.known_block\\t{address}\\t{other}\\t8\\thint\\n' >> hints.csv\n"
+                    f"\t$ ddisasm --hints ./hints.csv [...]\n\n")
+        command = ["ddisasm", "input", "--ir", "input.gtirb"]
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "recovery.log"
+            with patch("gsfork_elf.pipeline.execute", return_value=subprocess.CompletedProcess(
+                    command, 0, tie("0x174ba8", "data", "padding") + tie("0x174bb0", "data", "padding"))):
+                run(command, log)
+            with patch("gsfork_elf.pipeline.execute", return_value=subprocess.CompletedProcess(
+                    command, 0, tie("0x174ba8", "code", "data"))):
+                with self.assertRaisesRegex(RewriteError, "diagnostics"):
+                    run(command, log)
+
     def test_cfi_expression_registers(self):
         self.assertEqual(expression_registers([0x76, 0x78, 0x06]), {6})  # *(rbp - 8)
         self.assertEqual(expression_registers([0x76, 0]), {6})

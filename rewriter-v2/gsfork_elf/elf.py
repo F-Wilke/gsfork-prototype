@@ -108,6 +108,7 @@ class Image:
         self.local_tls_names = set()
         self.tls_symbols = {}
         self.dynamic_symbols = []
+        self.exported_symbols = []  # defined, non-local .dynsym names
         self.strong_imports = []
         self.function_ranges = []
         self.symbol_versions = []
@@ -142,6 +143,8 @@ class Image:
                         self.symbol_bindings[symbol.name].add((section_index, index, symbol.bind))
                     if section.name == ".dynsym" and symbol.name:
                         self.dynamic_symbols.append((symbol.name, symbol.type))
+                        if symbol.shndx != "SHN_UNDEF" and symbol.bind != "STB_LOCAL":
+                            self.exported_symbols.append(symbol.name)
                         if symbol.shndx == "SHN_UNDEF" and symbol.bind == "STB_GLOBAL":
                             self.strong_imports.append(symbol.name)
                         if versym:

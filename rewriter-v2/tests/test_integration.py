@@ -6,6 +6,7 @@ import signal
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import gtirb
@@ -15,6 +16,7 @@ from gsfork_elf.elf import Image
 from gsfork_elf.benchmark import compare
 from gsfork_elf.errors import RewriteError
 from gsfork_elf.metadata import Metadata, Reader
+from gsfork_elf import pipeline
 from gsfork_elf.pipeline import rewrite
 from gsfork_elf.policy import Runtime
 from gsfork_elf.validator import validate_artifact
@@ -67,6 +69,33 @@ class IntegrationTests(unittest.TestCase):
         self.assertGreater(self.report["validation"]["generated_plt_slots"], 0)
         persisted = json.loads(Path(str(self.output) + ".gsfork/report.json").read_text())
         self.assertEqual(validate_artifact(self.output, persisted), self.report["validation"])
+
+    def test_export_dynamic_executable_keeps_exports(self):
+        source = self.work / "exported.c"
+        source.write_text("#include <stdio.h>\n"
+                          "int exported_counter = 1;\n"
+                          "int exported_function(int x) { return x + exported_counter; }\n"
+                          "int main(void) { printf(\"%d\\n\", exported_function(41)); return 0; }\n")
+        binary = self.work / "exported"
+        command(["gcc", "-O2", "-rdynamic", source, "-o", binary])
+        rewritten = self.work / "exported.gs"
+        verify_tls = pipeline.verify_tls
+
+        def drop_dynsym_info(module, image):
+            # Ddisasm may omit .dynsym table info for exported definitions in
+            # large binaries (postgres); exports must survive from the input ELF.
+            tables = module.aux_data["elfSymbolTabIdxInfo"].data
+            for symbol in module.symbols:
+                if symbol.name.startswith("exported_") and symbol in tables:
+                    tables[symbol] = [entry for entry in tables[symbol] if entry[0] != ".dynsym"]
+            return verify_tls(module, image)
+
+        with mock.patch.object(pipeline, "verify_tls", drop_dynsym_info):
+            rewrite(binary, rewritten, trusted_libraries=TRUST)
+        symbols = set(Image(rewritten).dynamic_symbols)
+        self.assertIn(("exported_function", "STT_FUNC"), symbols)
+        self.assertIn(("exported_counter", "STT_OBJECT"), symbols)
+        self.assertEqual(command([rewritten]).stdout, "42\n")
 
     def test_initializer_aliases_have_elf_symbol_metadata(self):
         artifacts = Path(str(self.output) + ".gsfork")

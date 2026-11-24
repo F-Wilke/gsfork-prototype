@@ -183,6 +183,14 @@ def run(command, log, *, allow_absent_entry=False, repair_header_symbol=False, l
     if repair_header_symbol:
         diagnostics = diagnostics.replace("WARNING: Moving symbol to first block of section: __ehdr_start", "")
     diagnostics = diagnostics.replace("WARNING: Moving symbol to first block of section: __bss_start", "INFO: Moving symbol to first block of section: __bss_start")
+    # A data/padding tie over the same bytes: ddisasm keeps them as data, which
+    # reproduces them verbatim (large binaries such as postgres have thousands).
+    diagnostics = re.sub(
+        r"WARNING: The following block intervals have equal weights \(interval scheduling\): *\n"
+        r"\tdata at (0x[0-9a-f]+), (\d+) bytes \(selected\)\n"
+        r"\tpadding at \1, \2 bytes \(not selected\)\n"
+        r"(?:\n\tTo select the other block, re-run ddisasm with hints, e\.g\.:\n\t\$ printf [^\n]*\n\t\$ ddisasm --hints [^\n]*\n)?",
+        "", diagnostics)
     # Ddisasm wants a GLOBAL/WEAK destination for each GOT slot and falls back
     # to the first symbol of that name. That is the right one for a uniquely
     # named LOCAL definition (a RELATIVE GOT slot, checked again by validation).
@@ -603,6 +611,16 @@ def print_ir(ir_path, binary, assembly, log, library_paths, *, image=None, entry
         # by GD->LE TLS relaxation); the linker otherwise drops them silently.
         for name in image.strong_imports:
             command.append(f"--compiler-args=-Wl,--undefined={name}")
+        if image.executable_tls and image.exported_symbols:
+            # Ddisasm can omit .dynsym metadata for exported definitions of an
+            # --export-dynamic executable (postgres lost 5941 of 11559), so the
+            # pprinter would not export them; take the export set from the ELF.
+            # Shared objects export all default-visibility symbols anyway, and
+            # there --dynamic-list would change symbol binding.
+            dynamic_list = assembly.with_suffix(".dynamic-list")
+            dynamic_list.write_text("{\n" + "".join(
+                f'  "{name}";\n' for name in sorted(set(image.exported_symbols))) + "};\n")
+            command.append(f"--compiler-args=-Wl,--dynamic-list={dynamic_list}")
     for section in (".dynsym", ".dynstr", ".gnu.hash", ".hash",
                     ".gnu.version", ".gnu.version_r", ".gnu.version_d"):
         command.extend(["--skip-section", section])

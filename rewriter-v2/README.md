@@ -209,7 +209,9 @@ Reports are correctness evidence, not cryptographically authenticated certificat
    header symbol; and the paired missing-GLOBAL/WEAK diagnostic for a *local*
    IFUNC whose IRELATIVE references are verified against their recovered resolver
    code; and local initial-exec TLS symbols whose TPOFF64 references and offsets
-   are verified against PT_TLS. All diagnostics remain in the recovery log.
+   are verified against PT_TLS; and equal-weight interval-scheduling ties in
+   which Ddisasm keeps the bytes as data rather than padding (the bytes are
+   reproduced verbatim). All diagnostics remain in the recovery log.
    Other recovery warnings are not ignored.
 3. Produce an unmodified native reassembly control.
 4. Classify **every** recovered instruction. Attach block-boundary symbols and

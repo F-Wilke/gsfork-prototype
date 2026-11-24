@@ -242,8 +242,10 @@ def validate_artifact(path, report):
         raise RewriteError(f"{path}: relinking changed DT_NEEDED dependencies/order")
     if not baseline and set(image.libraries) - set(report["trusted_libraries"]):
         raise RewriteError(f"{path}: undeclared dynamic-library trust boundary")
-    if not set(map(tuple, report["input_dynamic_symbols"])) <= set(image.dynamic_symbols):
-        raise RewriteError(f"{path}: relinking lost a dynamic symbol/type")
+    lost = set(map(tuple, report["input_dynamic_symbols"])) - set(image.dynamic_symbols)
+    if lost:
+        shown = ", ".join(f"{name} ({kind})" for name, kind in sorted(lost)[:8])
+        raise RewriteError(f"{path}: relinking lost {len(lost)} dynamic symbol/type(s): {shown}")
     if not set(map(tuple, report["input_symbol_versions"])) <= set(image.symbol_versions):
         raise RewriteError(f"{path}: relinking changed symbol binding, visibility, or version")
     if sorted(report["input_version_definitions"]) != sorted(image.version_definitions):
