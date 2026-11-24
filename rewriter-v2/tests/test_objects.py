@@ -113,19 +113,98 @@ class ObjectRewriteTests(unittest.TestCase):
         subprocess.run([self.work / "run"], check=True)
 
     def test_short_branch_overflow(self):
+        for branch in ("jmp", "jz", "jrcxz", "jecxz"):
+            with self.subTest(branch=branch):
+                source = f"""
+            .globl f
+            .type f,@function
+            f:
+            .cfi_startproc
+            xor %eax,%eax
+            xor %ecx,%ecx
+            {branch} 1f
+            .rept 59
+            mov (%rdi),%eax
+            .endr
+            1: mov g(%rip),%eax
+            ret
+            .cfi_endproc
+            .size f,.-f
+        """
+                self.gcc("-c", "-x", "assembler", "-", "-o", self.obj, source=source)
+                output = self.work / f"{branch}.o"
+                rewrite(self.obj, output)
+                self.gcc(output, "-xc", "-", "-o", branch,
+                         source="int g=7; int f(int*); int main(){int n=3;return f(&n)!=7;}")
+                subprocess.run([self.work / branch], check=True)
+                with output.open("rb") as stream:
+                    elf = ELFFile(stream)
+                    func, = elf.get_section_by_name(".symtab").get_symbol_by_name("f")
+                    _, fde = elf.get_dwarf_info().EH_CFI_entries()
+                    self.assertEqual(fde["address_range"], func["st_size"])
+
+    def test_branch_widening_reaches_fixed_point(self):
         self.gcc("-c", "-x", "assembler", "-", "-o", self.obj, source="""
             .globl f
             .type f,@function
             f: jmp 1f
-            .rept 60
+            .rept 3
+            nop
+            .endr
+            jmp 2f
+            .rept 120
+            nop
+            .endr
+            1:
+            .rept 3
             mov (%rdi),%eax
             .endr
-            1: ret
+            2: ret
             .size f,.-f
         """)
-        with self.assertRaisesRegex(RewriteError, "internal displacement overflow"):
-            rewrite(self.obj, self.out)
-        self.assertFalse(self.out.exists())
+        rewrite(self.obj, self.out)
+        with self.out.open("rb") as stream:
+            elf = ELFFile(stream)
+            code = elf.get_section_by_name(".text").data()
+            self.assertEqual(code[0], 0xe9)
+            self.assertEqual(code[8], 0xe9)
+        self.gcc(self.out, "-xc", "-", "-o", "run",
+                 source="int f(int*); int main(){int n=9;return f(&n)!=9;}")
+        subprocess.run([self.work / "run"], check=True)
+
+    def test_backward_short_branches_preserve_flags_and_count(self):
+        for branch in ("jnz", "loop", "loope", "loopne", "jrcxz"):
+            with self.subTest(branch=branch):
+                if branch == "jnz":
+                    control = "dec %ecx"
+                elif branch == "jrcxz":
+                    control = "mov $1,%ecx; cmp %ecx,%ecx"
+                else:
+                    control = "test %eax,%eax" if branch == "loopne" else "cmp %ecx,%ecx"
+                self.gcc("-c", "-x", "assembler", "-", "-o", self.obj, source=f"""
+                    .globl f
+                    .type f,@function
+                    f: mov $2,%ecx
+                    1:
+                    .rept 59
+                    mov (%rdi),%eax
+                    .endr
+                    {control}
+                    {branch} 1b
+                    setz %dl
+                    movzbl %dl,%edx
+                    shl $8,%edx
+                    mov %ecx,%eax
+                    or %edx,%eax
+                    ret
+                    .size f,.-f
+                """)
+                output = self.work / f"{branch}.o"
+                rewrite(self.obj, output)
+                expected = 257 if branch == "jrcxz" else 0 if branch == "loopne" else 256
+                self.gcc(output, "-xc", "-", "-o", branch,
+                         source=f"int f(int*); int main(){{int n=9;return f(&n)!={expected};}}")
+                subprocess.run([self.work / branch], check=True, timeout=5)
 
     def test_debug_rejected_before_publication(self):
         self.compile("int f(int *p){return *p;}", "-g")

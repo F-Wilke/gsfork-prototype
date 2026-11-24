@@ -62,8 +62,12 @@ instruction relocation offsets, code-target addends, and supported GNU x86-64
 data and symbol indices remain available to the linker. The post-link pass and
 object mode both run without Ddisasm.
 
+Short branches are widened as needed, with layout recomputed until it stabilizes.
+LOOP/JCXZ-family branches use flag-preserving local trampolines when their short
+displacements overflow.
+
 This prototype rejects debug sections, exception tables, unsupported CFI programs,
-wrapper expansions, and internal displacements or CFI advances that outgrow their
+wrapper expansions, and rel32 displacements or CFI advances that outgrow their
 encoding. Compile without debug info for this path. Stripped or hand-written
 objects with missing function boundaries need another recovery strategy. The
 existing linked-ELF path remains available for its broader recovery and wrapper

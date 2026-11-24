@@ -21,6 +21,32 @@ SPECIAL = {".comment", ".note.GNU-stack", ".note.gnu.property", ".eh_frame"}
 
 
 def code_section(sec, relocs, functions, runtime, trusted, baseline):
+    widened = set()
+    while True:
+        output, positions, ends, fields, count, overflows = layout_code_section(
+            sec, relocs, functions, runtime, trusted, baseline, widened)
+        if not overflows:
+            return output, positions, ends, fields, count
+        widened.update(overflows)
+
+
+def widen_branch(raw):
+    opcode = raw[-2]
+    prefixes = raw[:-2]
+    if opcode == 0xeb:
+        require(len(prefixes) + 5 <= 15, "widened branch exceeds instruction length limit")
+        return prefixes + b'\xe9' + bytes(4)
+    if 0x70 <= opcode <= 0x7f:
+        require(len(prefixes) + 6 <= 15, "widened branch exceeds instruction length limit")
+        return prefixes + bytes((0x0f, opcode + 0x10)) + bytes(4)
+    if 0xe0 <= opcode <= 0xe3:
+        # LOOP/JCXZ have no near form. Preserve their flags/count behavior and
+        # branch over a fall-through skip to a rel32 jump.
+        return prefixes + bytes((opcode, 2, 0xeb, 5, 0xe9)) + bytes(4)
+    raise RewriteError("unsupported short branch widening")
+
+
+def layout_code_section(sec, relocs, functions, runtime, trusted, baseline, widened):
     original = sec.data()
     output = bytearray()
     positions = {}
@@ -49,6 +75,12 @@ def code_section(sec, relocs, functions, runtime, trusted, baseline):
                     f"{sec.name}+{start:#x}: bytes outside sized functions are not NOPs")
         rule = 'trusted' if trusted else classify(ins, runtime)
         raw = original[start:end]
+        constants = decoder.get_constant_offsets(ins)
+        branch = ins.op0_kind in (OpKind.NEAR_BRANCH64, OpKind.NEAR_BRANCH32, OpKind.NEAR_BRANCH16)
+        if start in widened:
+            require(branch and constants.immediate_size == 1,
+                    f"{sec.name}+{start:#x}: unsupported branch widening")
+            raw = widen_branch(raw)
         if rule == 'gs' and not baseline:
             require(ins.segment_prefix == Register.NONE, "unsupported object segment substitution")
             raw = b'\x65' + raw
@@ -60,8 +92,6 @@ def code_section(sec, relocs, functions, runtime, trusted, baseline):
         output.extend(raw)
         ends[end] = len(output)
         shift = len(output) - end
-        constants = decoder.get_constant_offsets(ins)
-        branch = ins.op0_kind in (OpKind.NEAR_BRANCH64, OpKind.NEAR_BRANCH32, OpKind.NEAR_BRANCH16)
         for offset, size, relative, target in (
                 (constants.displacement_offset, constants.displacement_size,
                  ins.is_ip_rel_memory_operand, ins.ip_rel_memory_address),
@@ -75,18 +105,25 @@ def code_section(sec, relocs, functions, runtime, trusted, baseline):
                         f"{sec.name}+{field:#x}: unsupported instruction relocation {kind}")
                 fields[field] = (field + shift, end - field)
             elif relative:
-                fixups.append((field + shift, size, target, len(output)))
+                if start in widened:
+                    fixups.append((len(output) - 4, 4, target, len(output), start))
+                else:
+                    fixups.append((field + shift, size, target, len(output), start))
     positions[len(original)] = len(output)
     require(all(start in positions and end in ends for start, end in ranges),
             f"{sec.name}: function boundary inside instruction")
     require(fields.keys() == relocs.keys(), f"{sec.name}: relocation outside operand")
-    for offset, width, target, end in fixups:
+    overflows = set()
+    for offset, width, target, end, start in fixups:
         require(target in positions, f"{sec.name}: unresolved internal reference {target:#x}")
         delta = positions[target] - end
-        require(-(1 << (8*width-1)) <= delta < 1 << (8*width-1),
-                f"{sec.name}: internal displacement overflow")
+        if not -(1 << (8*width-1)) <= delta < 1 << (8*width-1):
+            require(width == 1 and start not in widened,
+                    f"{sec.name}: internal displacement overflow")
+            overflows.add(start)
+            continue
         output[offset:offset+width] = delta.to_bytes(width, 'little', signed=True)
-    return output, positions, ends, fields, count
+    return output, positions, ends, fields, count, overflows
 
 
 def update_frames(data, references):
