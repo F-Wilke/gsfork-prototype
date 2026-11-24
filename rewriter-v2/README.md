@@ -52,11 +52,15 @@ jump against the original dynamic relocation. The final report covers the PLT
 only. The caller owns the instrumentation or trust decision for each input,
 including CRT code and libraries.
 
-The object path decodes sized function bodies as instructions, accepts NOPs between
+The object path decodes function bodies as instructions, accepts NOPs between
 functions, and assumes compiler-generated code without embedded data or hidden
-address constants. It supports multiple functions per section, ordinary GS prefixes,
-local branches and RIP-relative references, PC32/PLT32/GOTPCREL-family operands,
-and absolute 64-bit code pointers in data. Symbol sizes, function alignment,
+address constants. Unsized function symbols delimit bodies through the next function
+or section end; their symbol sizes remain zero. `.init`/`.fini` fragments also work
+without function symbols, including symbol-less CRT epilogues. It supports multiple
+functions per section, ordinary GS prefixes, local branches and RIP-relative
+references, PC32/PLT32/GOTPCREL-family and dynamic TLS operands, relative jump tables
+with explicitly referenced table bases, and absolute 64-bit code pointers in data.
+Symbol sizes, function alignment,
 instruction relocation offsets, code-target addends, and supported GNU x86-64
 `.eh_frame` ranges and CFI location advances follow instruction growth. Unchanged
 data and symbol indices remain available to the linker. The post-link pass and
@@ -64,14 +68,20 @@ object mode both run without Ddisasm.
 
 Short branches are widened as needed, with layout recomputed until it stabilizes.
 LOOP/JCXZ-family branches use flag-preserving local trampolines when their short
-displacements overflow.
+displacements overflow. CFI advances widen to larger encodings as needed; growing
+FDEs retain their CIE links, relocation offsets, and unwind states. Standard `zR`
+and `zPLR` GNU x86-64 CIEs are supported. Function-relative ULEB128 LSDA call-site
+ranges and landing pads are remapped while retaining action and type tables.
+MOVS/STOS use the shared canonical wrappers and require the explicit FS runtime
+slots described below. Unwind states that depend on their temporary registers
+are rejected. GNU ABI and SystemTap notes retain their relocated addresses.
 
-This prototype rejects debug sections, exception tables, unsupported CFI programs,
-wrapper expansions, and rel32 displacements or CFI advances that outgrow their
-encoding. Compile without debug info for this path. Stripped or hand-written
-objects with missing function boundaries need another recovery strategy. The
-existing linked-ELF path remains available for its broader recovery and wrapper
-support.
+This prototype rejects debug sections, unsupported CFI/LSDA encodings, LEAVE
+expansions, overflowing rel32 displacements, and LSDA values that outgrow their
+existing ULEB128 fields. Compile without debug info for this path. Stripped or
+hand-written objects with missing function boundaries outside `.init`/`.fini`
+need another recovery strategy. The existing linked-ELF path remains available
+for its broader recovery and wrapper support.
 
 Repeat `--trust-library` for each `DT_NEEDED` library. C++ programs commonly also
 need `--trust-library libstdc++.so.6 --trust-library libgcc_s.so.1`. `-L DIR`
