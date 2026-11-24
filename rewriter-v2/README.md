@@ -3,7 +3,8 @@
 A working, **fail-closed, restricted linked-ELF rewriter** implementing the
 [v2 manifest](gs-fork-elf-rewriter-manifest-v2.md). This is independent of the
 older reserved-slot Python prototype and the `../rewriter` ET_REL implementation.
-Its inputs are already-linked x86-64 Linux executables, PIEs, and shared objects.
+It accepts x86-64 Linux executables, PIEs, shared objects, and the relocatable
+objects described below.
 Application source, compiler assembly, reserved slots, and retained static
 relocations are not required.
 
@@ -31,6 +32,42 @@ make check
     --trust-library libc.so.6
 .venv/bin/gsfork-elf validate /path/to/program.gs
 ```
+
+### Rewrite an object and finalize the PLT after linking
+
+```sh
+gcc -O2 -fPIC -c worker.c -o worker.o
+gsfork-elf rewrite worker.o worker.gs.o
+gsfork-elf validate worker.gs.o
+gcc driver.o worker.gs.o -Wl,-z,now,--no-relax -o driver.linked
+gsfork-elf patch-plt driver.linked driver.gs
+gsfork-elf validate driver.gs
+```
+
+Object mode emits another ET_REL. The ordinary linker chooses symbol addresses and
+creates PLT entries. Use eager binding and disable instruction relaxation. Run the
+PLT pass once per linked executable or DSO. It checks recognized GNU ld slots,
+patches them in place, preserves ENDBR64 where present, and validates the translated
+jump against the original dynamic relocation. The final report covers the PLT
+only. The caller owns the instrumentation or trust decision for each input,
+including CRT code and libraries.
+
+The object path decodes sized function bodies as instructions, accepts NOPs between
+functions, and assumes compiler-generated code without embedded data or hidden
+address constants. It supports multiple functions per section, ordinary GS prefixes,
+local branches and RIP-relative references, PC32/PLT32/GOTPCREL-family operands,
+and absolute 64-bit code pointers in data. Symbol sizes, function alignment,
+instruction relocation offsets, code-target addends, and supported GNU x86-64
+`.eh_frame` ranges and CFI location advances follow instruction growth. Unchanged
+data and symbol indices remain available to the linker. The post-link pass and
+object mode both run without Ddisasm.
+
+This prototype rejects debug sections, exception tables, unsupported CFI programs,
+wrapper expansions, and internal displacements or CFI advances that outgrow their
+encoding. Compile without debug info for this path. Stripped or hand-written
+objects with missing function boundaries need another recovery strategy. The
+existing linked-ELF path remains available for its broader recovery and wrapper
+support.
 
 Repeat `--trust-library` for each `DT_NEEDED` library. C++ programs commonly also
 need `--trust-library libstdc++.so.6 --trust-library libgcc_s.so.1`. `-L DIR`

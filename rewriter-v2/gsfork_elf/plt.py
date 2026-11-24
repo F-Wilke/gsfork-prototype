@@ -53,7 +53,10 @@ def patch_plt(image, *, require_now=True):
             raise RewriteError(f"{image.path}: PLT rewriting requires DT_BIND_NOW/DF_BIND_NOW")
         data, base = section.data(), section["sh_addr"]
         cet = image.elf.get_section_by_name(".plt.sec") is not None
-        stride = 8 if section.name == ".plt.got" and not cet else 16
+        # GNU ld can emit IBT .plt.got without any .plt.sec entries.
+        stride = section["sh_entsize"] if section.name == ".plt.got" else 16
+        if stride not in (8, 16):
+            fail(image.path, section.name, base, "unsupported generated PLT entry size")
         if len(data) % stride:
             fail(image.path, section.name, base, "invalid generated PLT slot size")
         for offset in range(0, len(data), stride):
