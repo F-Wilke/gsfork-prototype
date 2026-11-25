@@ -56,7 +56,9 @@ The object path decodes function bodies as instructions, accepts NOPs between
 functions, and assumes compiler-generated code without embedded data or hidden
 address constants. Unsized function symbols delimit bodies through the next function
 or section end; their symbol sizes remain zero. `.init`/`.fini` fragments also work
-without function symbols, including symbol-less CRT epilogues. It supports multiple
+without function symbols, including symbol-less CRT epilogues. Assembly sections
+without typed function symbols may use global/weak NOTYPE entry markers and aliases;
+these also delimit instruction-only bodies, not embedded data. It supports multiple
 functions per section, ordinary GS prefixes, local branches and RIP-relative
 references, PC32/PLT32/GOTPCREL-family and dynamic TLS operands, relative jump tables
 with explicitly referenced table bases, and absolute 64-bit code pointers in data.
@@ -72,15 +74,16 @@ displacements overflow. CFI advances widen to larger encodings as needed; growin
 FDEs retain their CIE links, relocation offsets, and unwind states. Standard `zR`
 and `zPLR` GNU x86-64 CIEs are supported. Function-relative ULEB128 LSDA call-site
 ranges and landing pads are remapped while retaining action and type tables.
+Growing LSDA fields rebuild their headers, move subsequent records and type-table
+relocations, and update FDE references. Empty cold sections retain zero-range FDEs.
 MOVS/STOS use the shared canonical wrappers and require the explicit FS runtime
 slots described below. Unwind states that depend on their temporary registers
 are rejected. GNU ABI and SystemTap notes retain their relocated addresses.
 
 This prototype rejects debug sections, unsupported CFI/LSDA encodings, LEAVE
-expansions, overflowing rel32 displacements, and LSDA values that outgrow their
-existing ULEB128 fields. Compile without debug info for this path. Stripped or
-hand-written objects with missing function boundaries outside `.init`/`.fini`
-need another recovery strategy. The existing linked-ELF path remains available
+expansions, and overflowing rel32 displacements. Compile without debug info for
+this path. Stripped or hand-written objects with missing function boundaries
+outside `.init`/`.fini` need another recovery strategy. The existing linked-ELF path remains available
 for its broader recovery and wrapper support.
 
 Repeat `--trust-library` for each `DT_NEEDED` library. C++ programs commonly also

@@ -10,6 +10,8 @@ from gsfork_elf.elf import Image
 from gsfork_elf.errors import RewriteError
 from gsfork_elf.pipeline import rewrite
 from gsfork_elf.policy import Runtime
+from gsfork_elf.metadata import Reader
+from gsfork_elf.objects import ObjectMetadataBytes
 from gsfork_elf.validator import validate_artifact
 
 
@@ -397,7 +399,7 @@ class ObjectRewriteTests(unittest.TestCase):
         """, text=True, check=True)
         subprocess.run([self.work / "run"], check=True)
 
-    def test_lsda_growth_overflow_rejected_before_publication(self):
+    def test_lsda_call_site_fields_grow(self):
         self.gcc("-c", "-x", "assembler", "-", "-o", self.obj, source="""
             .globl f
             .type f,@function
@@ -417,9 +419,109 @@ class ObjectRewriteTests(unittest.TestCase):
             .section .gcc_except_table
             lsda: .byte 0xff,0xff,1,4,100,5,105,0
         """)
-        with self.assertRaisesRegex(RewriteError, "LSDA advance overflow"):
-            rewrite(self.obj, self.out)
-        self.assertFalse(self.out.exists())
+        rewrite(self.obj, self.out)
+        with self.out.open("rb") as stream:
+            elf = ELFFile(stream)
+            self.assertEqual(elf.get_section_by_name(".gcc_except_table").data(),
+                             bytes.fromhex("ffff01069601059b0100"))
+        self.gcc(self.out, "-xc", "-", "-o", "run",
+                 source="int throwing(){return 7;}void personality(){}"
+                        "int f(int*);int main(){int n=4;return f(&n)!=7;}")
+        subprocess.run([self.work / "run"], check=True)
+
+    def test_lsda_headers_type_relocations_and_following_record_move(self):
+        records = "\n".join(f".byte {i*2},2,105,1" for i in range(27))
+        self.gcc("-c", "-x", "assembler", "-", "-o", self.obj, source=f"""
+            .globl f,g,table
+            .type f,@function
+            f:
+            .cfi_startproc
+            .cfi_personality 0x9b,DW.ref.personality
+            .cfi_lsda 0x1b,lsda
+            .rept 50
+            mov (%rdi),%eax
+            .endr
+            call throwing
+            landing: ret
+            .cfi_endproc
+            .size f,.-f
+            .type g,@function
+            g:
+            .cfi_startproc
+            .cfi_personality 0x9b,DW.ref.personality
+            .cfi_lsda 0x1b,lsda2
+            mov (%rdi),%eax
+            ret
+            .cfi_endproc
+            .size g,.-g
+            .section .data.rel.local
+            DW.ref.personality: .quad personality
+            DW.ref.type: .quad typeinfo
+            .section .gcc_except_table
+            table:
+            .type table,@object
+            lsda: .byte 0xff,0x9b
+            .uleb128 typebase - .Ltypeoffset_end
+            .Ltypeoffset_end:
+            .byte 1
+            .uleb128 108
+            {records}
+            .byte 1,0
+            .long DW.ref.type - .
+            typebase:
+            lsda2: .byte 0xff,0xff,1,4,0,2,0,0
+            .size table,.-table
+        """)
+        rewrite(self.obj, self.out)
+        with self.out.open("rb") as stream:
+            elf = ELFFile(stream)
+            data = elf.get_section_by_name(".gcc_except_table").data()
+            reader = Reader(ObjectMetadataBytes(data), 0)
+            self.assertEqual((reader.byte(), reader.byte()), (255, 155))
+            type_base = reader.leb() + reader.address
+            self.assertEqual(type_base, 148)
+            self.assertEqual(reader.byte(), 1)
+            self.assertEqual(reader.leb(), 135)
+            for i in range(27):
+                self.assertEqual([reader.leb() for _ in range(4)], [i*3, 3, 155, 1])
+            self.assertEqual(reader.address, 142)
+            self.assertEqual(data[142:144], bytes((1, 0)))
+            reloc, = elf.get_section_by_name(".rela.gcc_except_table").iter_relocations()
+            self.assertEqual(reloc['r_offset'], 144)
+            fde_refs = list(elf.get_section_by_name(".rela.eh_frame").iter_relocations())
+            _, first, second = elf.get_dwarf_info().EH_CFI_entries()
+            self.assertEqual([r['r_addend'] for r in fde_refs
+                              if r['r_offset'] in (first.offset+17, second.offset+17)], [0, 148])
+            table, = elf.get_section_by_name(".symtab").get_symbol_by_name("table")
+            self.assertEqual(table['st_size'], 156)
+            self.assertEqual(data[148:], bytes.fromhex("ffff010400030000"))
+
+    def test_cpp_catch_after_lsda_field_growth(self):
+        subprocess.run(["g++", "-c", "-O2", "-fPIC", "-x", "c++", "-", "-o", self.obj],
+                       input="""
+            extern void throwing();
+            int f(int *p) {
+                try {
+                    asm volatile(".rept 50; movl (%0), %%eax; .endr" : : "r"(p) : "eax");
+                    throwing();
+                } catch (int n) { return n + *p; }
+                return 0;
+            }
+        """, text=True, check=True)
+        rewrite(self.obj, self.out)
+        with self.obj.open("rb") as a, self.out.open("rb") as b:
+            old, new = ELFFile(a), ELFFile(b)
+            self.assertGreater(sum(s['sh_size'] for s in new.iter_sections()
+                                   if s.name.startswith(".gcc_except_table")),
+                               sum(s['sh_size'] for s in old.iter_sections()
+                                   if s.name.startswith(".gcc_except_table")))
+        subprocess.run(["g++", self.out, "-Wl,-z,now,--no-relax", "-xc++", "-",
+                        "-o", self.work / "run"], input="""
+            void throwing(){throw 3;}
+            int f(int*);
+            int main(){int n=4;return f(&n)!=7;}
+        """, text=True, check=True)
+        subprocess.run([self.work / "run"], check=True)
 
     def test_unsized_function_markers(self):
         self.gcc("-c", "-x", "assembler", "-", "-o", self.obj, source="""
@@ -443,6 +545,59 @@ class ObjectRewriteTests(unittest.TestCase):
             g, = elf.get_section_by_name(".symtab").get_symbol_by_name("g")
             self.assertEqual(g['st_size'], 0)
             self.assertEqual(g['st_value'] % 16, 0)
+
+    def test_notype_global_assembly_markers_and_aliases(self):
+        self.gcc("-c", "-x", "assembler", "-", "-o", self.obj, source="""
+            .globl f,alias,g
+            f:
+            alias:
+            mov (%rdi),%eax
+            ret
+            .align 32
+            g: call f
+            add $1,%eax
+            ret
+        """)
+        rewrite(self.obj, self.out)
+        self.gcc(self.out, "-xc", "-", "-o", "run",
+                 source="int f(int*),alias(int*),g(int*);int main(){int n=4;"
+                        "return f(&n)!=4 || alias(&n)!=4 || g(&n)!=5;}")
+        subprocess.run([self.work / "run"], check=True)
+        with self.out.open("rb") as stream:
+            symbols = ELFFile(stream).get_section_by_name(".symtab")
+            f, = symbols.get_symbol_by_name("f")
+            alias, = symbols.get_symbol_by_name("alias")
+            self.assertEqual(f['st_value'], alias['st_value'])
+            self.assertEqual(f['st_info']['type'], 'STT_NOTYPE')
+            g, = symbols.get_symbol_by_name("g")
+            self.assertEqual(g['st_value'] % 32, 0)
+
+    def test_empty_cold_function_unwind(self):
+        self.gcc("-c", "-x", "assembler", "-", "-o", self.obj, source="""
+            .globl f
+            .type f,@function
+            f:
+            .cfi_startproc
+            mov (%rdi),%eax
+            ret
+            .cfi_endproc
+            .size f,.-f
+            .section .text.unlikely
+            .type cold,@function
+            cold:
+            .cfi_startproc
+            .cfi_endproc
+        """)
+        rewrite(self.obj, self.out)
+        with self.out.open("rb") as stream:
+            elf = ELFFile(stream)
+            _, first, cold = elf.get_dwarf_info().EH_CFI_entries()
+            self.assertEqual(first['address_range'], 4)
+            self.assertEqual(cold['address_range'], 0)
+            self.assertEqual(elf.get_section_by_name(".text.unlikely")['sh_size'], 0)
+        self.gcc(self.out, "-xc", "-", "-o", "run",
+                 source="int f(int*);int main(){int n=4;return f(&n)!=4;}")
+        subprocess.run([self.work / "run"], check=True)
 
     def test_symbol_less_init_epilogue_and_unsized_prologue(self):
         self.gcc("-c", "-x", "assembler", "-", "-o", self.obj, source="""

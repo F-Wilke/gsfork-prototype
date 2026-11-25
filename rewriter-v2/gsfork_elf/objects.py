@@ -287,46 +287,97 @@ def update_exception_tables(elf, sections, rela, symbols, maps, ends):
         start = symbol_code['st_value'] + code['r_addend']
         key = section, symbol['st_value'] + lsda['r_addend']
         require(key not in contexts, "shared object LSDA needs distinct code mappings")
-        contexts[key] = symbol_code['st_shndx'], start
+        contexts[key] = symbol_code['st_shndx'], start, start + fde['address_range']
     changed = {}
-    for (idx, offset), (code, start) in contexts.items():
-        data = changed.setdefault(idx, bytearray(sections[idx].data()))
-        reader = Reader(ObjectMetadataBytes(data), offset)
-        require(reader.byte() == 0xff, "unsupported object LSDA LPStart")
-        encoding = reader.byte()
-        if encoding != 0xff:
-            require(encoding == 0x9b, "unsupported object LSDA type encoding")
-            type_base = reader.leb() + reader.address
-            require(type_base <= len(data), "object LSDA type table outside section")
-        require(reader.byte() == 1, "unsupported object LSDA call-site encoding")
-        length = reader.leb()
-        finish = reader.address + length
-        require(finish <= len(data) and code in maps, "invalid object LSDA call-site table")
-        while reader.address < finish:
-            fields = []
-            values = []
-            for _ in range(4):
-                position = reader.address
-                values.append(reader.leb())
-                fields.append((position, reader.address - position))
-            low, size, landing, action = values
-            require(start + low in maps[code] and start + low + size in maps[code]
-                    and (not landing or start + landing in maps[code]),
-                    "object LSDA code reference outside instruction boundary")
-            new_low = maps[code][start+low] - maps[code][start]
-            boundary = start + low + size
-            new_end = ends[code].get(boundary, maps[code][boundary])
-            new_size = new_end - maps[code][start+low]
-            new_landing = maps[code][start+landing] - maps[code][start] if landing else 0
-            for (position, width), value in zip(fields, (new_low, new_size, new_landing, action)):
-                require(0 <= value < 1 << (width*7), "object LSDA advance overflow")
-                for i in range(width):
-                    data[position+i] = (value >> (7*i) & 127) | (128 if i+1 < width else 0)
-        require(reader.address == finish, "partial object LSDA call-site record")
+    locations = {}
     for idx, sec in enumerate(sections):
-        if sec.name.startswith(".gcc_except_table"):
-            require(idx in changed or not sec['sh_size'], "unreferenced object exception table")
-    return changed
+        if not sec.name.startswith(".gcc_except_table") or not sec['sh_size']:
+            continue
+        offsets = sorted(offset for section, offset in contexts if section == idx)
+        require(offsets, "unreferenced object exception table")
+        data = sec.data()
+        require(0 <= offsets[0] < len(data), "invalid object LSDA offset")
+        output = bytearray(data[:offsets[0]])
+        positions = {i: i for i in range(offsets[0]+1)}
+        for offset, limit in zip(offsets, offsets[1:] + [len(data)]):
+            require(offset < limit <= len(data), "invalid object LSDA record extent")
+            code, start, finish = contexts[idx, offset]
+            record, boundaries = rewrite_lsda(data[offset:limit], maps[code], ends[code], start, finish)
+            positions.update({offset + old: len(output) + new for old, new in boundaries.items()})
+            output.extend(record)
+        changed[idx] = output
+        locations[idx] = positions
+    return changed, locations
+
+
+def encode_uleb(value, minimum_width=1):
+    require(0 <= value < 1 << 64, "invalid object LSDA value")
+    width = max(minimum_width, max(1, (value.bit_length()+6)//7))
+    return bytes((value >> (7*i) & 127) | (128 if i+1 < width else 0) for i in range(width))
+
+
+def rewrite_lsda(data, positions, ends, start, function_end):
+    reader = Reader(ObjectMetadataBytes(data), 0)
+    require(reader.byte() == 0xff, "unsupported object LSDA LPStart")
+    encoding = reader.byte()
+    type_field = None
+    type_base = None
+    if encoding != 0xff:
+        require(encoding == 0x9b, "unsupported object LSDA type encoding")
+        old = reader.address
+        type_base = reader.leb() + reader.address
+        type_field = old, reader.address - old
+    encoding_offset = reader.address
+    require(reader.byte() == 1, "unsupported object LSDA call-site encoding")
+    length_offset = reader.address
+    length = reader.leb()
+    body_start = reader.address
+    finish = body_start + length
+    require(finish <= len(data) and (type_base is None or finish <= type_base <= len(data)),
+            "invalid object LSDA call-site/type table")
+    body = bytearray()
+    boundaries = {}
+    while reader.address < finish:
+        fields = []
+        values = []
+        for _ in range(4):
+            old = reader.address
+            values.append(reader.leb())
+            fields.append((old, reader.address - old))
+        low, size, landing, action = values
+        require(start <= start+low <= start+low+size <= function_end
+                and start+low in positions and start+low+size in positions
+                and (not landing or start <= start+landing < function_end
+                     and start+landing in positions),
+                "object LSDA code reference outside instruction boundary")
+        new_low = positions[start+low] - positions[start]
+        boundary = start + low + size
+        new_size = ends.get(boundary, positions[boundary]) - positions[start+low] if size else 0
+        new_landing = positions[start+landing] - positions[start] if landing else 0
+        for (old, width), value in zip(fields, (new_low, new_size, new_landing, action)):
+            boundaries[old] = len(body)
+            body.extend(encode_uleb(value, width))
+            boundaries[old+width] = len(body)
+    require(reader.address == finish, "partial object LSDA call-site record")
+    length_bytes = encode_uleb(len(body), body_start-length_offset)
+    output = bytearray(data[:2])
+    locations = {0: 0, 1: 1, 2: 2}
+    if type_field:
+        old, width = type_field
+        locations[old] = len(output)
+        # Action/type/specification bytes move together, preserving their relative links.
+        output.extend(encode_uleb(type_base-finish + 1 + len(length_bytes) + len(body), width))
+        locations[old+width] = len(output)
+    locations[encoding_offset] = len(output)
+    output.append(1)
+    locations[length_offset] = len(output)
+    output.extend(length_bytes)
+    locations.update({old: len(output)+new for old, new in boundaries.items()})
+    locations[body_start] = len(output)
+    output.extend(body)
+    locations.update({old: len(output)+old-finish for old in range(finish, len(data)+1)})
+    output.extend(data[finish:])
+    return output, locations
 
 
 def transform_object(source, runtime, trusted_sections=(), baseline=False):
@@ -371,14 +422,30 @@ def transform_object(source, runtime, trusted_sections=(), baseline=False):
     if not baseline:
         validate_string_unwind(elf, sections, code, rela, symbols, trusted_sections)
     changed = {}
+    metadata_maps = {}
     maps = {}
     ends = {}
     operands = {}
     counts = {}
+    for idx, sec in enumerate(sections):
+        if sec['sh_flags'] & 4 and not sec['sh_size']:
+            maps[idx] = {0: 0}
+            ends[idx] = {0: 0}
+            operands[idx] = {}
     functions_by_section = {}
     for symbol in symbols:
         if symbol['st_info']['type'] == 'STT_FUNC':
             functions_by_section.setdefault(symbol['st_shndx'], []).append(symbol)
+    for symbol in symbols:
+        idx = symbol['st_shndx']
+        if (idx in code and idx not in functions_by_section
+                and symbol['st_info']['type'] == 'STT_NOTYPE'
+                and symbol['st_info']['bind'] in ('STB_GLOBAL', 'STB_WEAK')):
+            functions_by_section[idx] = [
+                candidate for candidate in symbols
+                if candidate['st_shndx'] == idx
+                and candidate['st_info']['type'] == 'STT_NOTYPE'
+                and candidate['st_info']['bind'] in ('STB_GLOBAL', 'STB_WEAK')]
     table_bases = {}
     for idx, sec in code.items():
         entries = {r['r_offset']: r for r in rela.get(idx, (None, []))[1]}
@@ -404,7 +471,8 @@ def transform_object(source, runtime, trusted_sections=(), baseline=False):
             sec, types, functions, runtime, sec.name in trusted_sections, baseline)
     if any(sec.name.startswith(".gcc_except_table") and sec['sh_size'] for sec in sections):
         require(len(frames) == 1, "exception tables require one .eh_frame section")
-        changed.update(update_exception_tables(elf, sections, rela, symbols, maps, ends))
+        metadata, metadata_maps = update_exception_tables(elf, sections, rela, symbols, maps, ends)
+        changed.update(metadata)
     syms = bytearray(table.data()) if table is not None else bytearray()
     if symtabs:
         changed[symtabs[0]] = syms
@@ -416,6 +484,12 @@ def transform_object(source, runtime, trusted_sections=(), baseline=False):
             new_start = maps[idx][start]
             new_size = ends[idx][start + size] - new_start if size else 0
             struct.pack_into('<QQ', syms, 24 * i + 8, new_start, new_size)
+        elif idx in metadata_maps:
+            locations = metadata_maps[idx]
+            require(start in locations and (not size or start+size in locations),
+                    "unmapped exception-table symbol")
+            struct.pack_into('<QQ', syms, 24*i+8, locations[start],
+                             locations[start+size]-locations[start] if size else 0)
     frame_refs = {idx: {} for idx in frames}
     for target, (idx, entries) in rela.items():
         sec = sections[idx]
@@ -434,6 +508,9 @@ def transform_object(source, runtime, trusted_sections=(), baseline=False):
                 # GOTPCRELX relaxations may change the instruction at final link.
                 if kind in (41, 42) and not baseline:
                     kind = 9
+            elif target in metadata_maps:
+                require(offset in metadata_maps[target], "unmapped exception-table relocation")
+                offset = metadata_maps[target][offset]
             if target in frames:
                 require(kind == 2, "unsupported FDE relocation")
                 if dest in maps:
@@ -466,6 +543,13 @@ def transform_object(source, runtime, trusted_sections=(), baseline=False):
                     logical = start + addend + bias - table_bias
                     require(logical in maps[dest], "code relocation target outside instruction boundary")
                     addend = maps[dest][logical] - maps[dest][start] - bias + table_bias
+            elif dest in metadata_maps:
+                require(kind in (1, 2), "unsupported exception-table reference")
+                start = sym['st_value']
+                logical = start + addend + bias
+                require(start in metadata_maps[dest] and logical in metadata_maps[dest],
+                        "unmapped exception-table reference")
+                addend = metadata_maps[dest][logical] - metadata_maps[dest][start] - bias
             struct.pack_into('<QQq', out, 24*i, offset, r['r_info_sym'] << 32 | kind, addend)
     for idx in frames:
         changed[idx], locations = update_frames(sections[idx].data(), frame_refs[idx])

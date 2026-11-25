@@ -19,15 +19,15 @@ sahf sal sar sarx sbb sfence shl shld shlx shr shrd shrx stc std sub test
 tzcnt ud2 xadd xchg xor
 addpd addps addsd addss andpd andps andnpd andnps comisd comiss cvtdq2pd
 cvtdq2ps cvtpd2ps cvtps2pd cvtsd2si cvtsd2ss cvtsi2sd cvtsi2ss cvtss2sd
-cvtss2si cvttsd2si cvttss2si divpd divps divsd divss ldmxcsr stmxcsr
+cvtss2si cvttsd2si cvttss2si cmpps divpd divps divsd divss ldmxcsr stmxcsr
 maxpd maxps maxsd maxss minpd minps minsd minss movapd movaps movd movdqa
-movdqu movhpd movhps movlpd movlps movmskpd movmskps movntdq movnti
+movdqu movhpd movhps movhlps movlpd movlps movmskpd movmskps movntdq movnti
 movntpd movntps movq movsd movss movupd movups mulpd mulps mulsd mulss
 orpd orps packssdw packsswb packuswb paddb paddd paddq paddw pand pandn
 pcmpeqb pcmpeqd pcmpeqw pcmpgtb pcmpgtd pcmpgtw pextrw pinsrw pmovmskb
 pmulhuw pmulhw pmullw pmuludq por pshufd pshufhw pshuflw pshufw pslld
 pslldq psllq psllw psrad psraw psrld psrldq psrlq psrlw psubb psubd psubq
-psubw punpckhbw punpckhdq punpckhqdq punpckhwd punpcklbw punpckldq
+psubw psubusb punpckhbw punpckhdq punpckhqdq punpckhwd punpcklbw punpckldq
 punpcklqdq punpcklwd pxor shufpd shufps sqrtpd sqrtps sqrtsd sqrtss
 subpd subps subsd subss ucomisd ucomiss unpckhpd unpckhps unpcklpd
 unpcklps xorpd xorps vzeroupper vzeroall
@@ -60,6 +60,14 @@ vpextrq vpinsrq vpaddq vpsllq vpsrlq vpunpcklqdq vpermq
 vextracti128 vinserti128
 vbroadcasti32x4 vextracti32x4 vextracti64x4 vmovdqa32
 vpxord vpandd vpternlogq vpclmulqdq vpopcntq
+""".split())
+# Explicit-memory/register SIMD forms used by LLVM's BLAKE3 implementations.
+ORDINARY |= set("""
+pblendw blendvps vpaddd vpcmpgtd vpsubd vinsertf128 vunpckhpd vshufps
+vbroadcasti128 vpsrld vpslld vunpcklps vunpckhps vblendps vperm2f128
+vpunpckldq vpunpckhdq vpblendd vpshufd vblendvps vpinsrd
+kmovw knotw vpcmpud vinserti64x4 vpunpckhqdq vpermt2d vpermi2d vprord
+vshufi32x4 vpblendmd vinserti32x4
 """.split())
 #X87 floating-point instructions for libm
 ORDINARY |= set("""
