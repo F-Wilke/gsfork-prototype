@@ -52,6 +52,9 @@ jump against the original dynamic relocation. The final report covers the PLT
 only. The caller owns the instrumentation or trust decision for each input,
 including CRT code and libraries.
 
+For the reproducible GCC `cc1` and Clang object-first experiments, see
+[`tools/README.md`](tools/README.md).
+
 The object path decodes function bodies as instructions, accepts NOPs between
 functions, and assumes compiler-generated code without embedded data or hidden
 address constants. Unsized function symbols delimit bodies through the next function
