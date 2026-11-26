@@ -76,6 +76,9 @@ def parser():
         command.add_argument("--trust-section", action="append", default=[])
         command.add_argument("--trust-library", action="append", default=[])
         command.add_argument("-L", "--library-path", action="append", default=[])
+    plt = commands.add_parser("patch-plt", help="finalize GNU ld eager PLT slots after linking rewritten objects")
+    plt.add_argument("input", type=Path)
+    plt.add_argument("output", type=Path)
     validate = commands.add_parser("validate")
     validate.add_argument("input", type=Path)
     validate.add_argument("--report", type=Path)
@@ -95,6 +98,9 @@ def main(argv=None):
             report_path = args.report or Path(str(args.input) + ".gsfork/report.json")
             report = json.loads(report_path.read_text())
             result = {"mode": report["mode"], **validate_artifact(args.input, report)}
+        elif args.command == "patch-plt":
+            report = rewrite(args.input, args.output, plt_only=True)
+            result = {"mode": report["mode"], "output": report["output"], **report["validation"]}
         elif args.command == "compare":
             from .benchmark import compare
             result = compare(args.original, args.baseline, args.rewritten, args.samples, args.arg)

@@ -224,6 +224,32 @@ def check_leave(instructions, runtime, original):
 
 
 def validate_artifact(path, report):
+    mode = report["mode"]
+    if report["schema"] == 1 and mode in ("plt-only", "object-gs", "object-baseline"):
+        from pathlib import Path
+        from elftools.elf.elffile import ELFFile
+
+        if hashlib.sha256(Path(path).read_bytes()).hexdigest() != report["output_sha256"]:
+            raise RewriteError("artifact hash mismatch")
+        if mode == "plt-only":
+            entries, _ = validate_plt(Image(path), report["generated"])
+            return {"live_plt_slots": len(entries)}
+        with open(path, "rb") as stream:
+            elf = ELFFile(stream)
+            if elf["e_type"] != "ET_REL":
+                raise RewriteError("expected object file")
+            counts = {}
+            for sec in elf.iter_sections():
+                if sec["sh_flags"] & 4 and sec["sh_size"]:
+                    instructions = decode(sec.data(), 0)
+                    counts[sec.name] = 0
+                    if sec.name not in report["trusted_sections"]:
+                        for ins in instructions:
+                            classify(ins, Runtime(**report["runtime"]), output=mode == "object-gs")
+                            counts[sec.name] += ins.segment_prefix == Register.GS
+            if counts != report["sections"]:
+                raise RewriteError("object instrumentation count mismatch")
+        return {"gs_prefixes": sum(counts.values()), "code_sections": len(counts)}
     image = Image(path)
     if report["schema"] != 1 or report["mode"] not in ("baseline", "gs"):
         raise RewriteError("unsupported provenance report schema/mode")

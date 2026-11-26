@@ -20,6 +20,17 @@ class PolicyTests(unittest.TestCase):
                     self.rule(code, output=True)
                 self.assertEqual(self.rule("65" + code, output=True), "gs")
 
+    def test_llvm_simd_memory_and_register_forms(self):
+        for code in ("660fd800", "660f3a0e0003", "c5fdfe00", "c5f9700000",
+                     "c4e27d5a00", "62f17d48fe00"):
+            with self.subTest(code=code):
+                self.assertEqual(self.rule(code), "gs")
+                self.assertEqual(self.rule("65" + code, output=True), "gs")
+                with self.assertRaisesRegex(RewriteError, "uncovered"):
+                    self.rule(code, output=True)
+        self.assertEqual(self.rule("0f12c1"), "native")
+        self.assertEqual(self.rule("c5f890c1"), "native")
+
     def test_native_alias_and_logical_address(self):
         for code in ("50", "58", "9c", "9d", "c3", "c9", "ffd0", "ffe0",
                      "e800000000", "eb00", "fc", "fd", "3effe0", "3effd0"):

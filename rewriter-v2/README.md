@@ -3,7 +3,8 @@
 A working, **fail-closed, restricted linked-ELF rewriter** implementing the
 [v2 manifest](gs-fork-elf-rewriter-manifest-v2.md). This is independent of the
 older reserved-slot Python prototype and the `../rewriter` ET_REL implementation.
-Its inputs are already-linked x86-64 Linux executables, PIEs, and shared objects.
+It accepts x86-64 Linux executables, PIEs, shared objects, and the relocatable
+objects described below.
 Application source, compiler assembly, reserved slots, and retained static
 relocations are not required.
 
@@ -31,6 +32,62 @@ make check
     --trust-library libc.so.6
 .venv/bin/gsfork-elf validate /path/to/program.gs
 ```
+
+### Rewrite an object and finalize the PLT after linking
+
+```sh
+gcc -O2 -fPIC -c worker.c -o worker.o
+gsfork-elf rewrite worker.o worker.gs.o
+gsfork-elf validate worker.gs.o
+gcc driver.o worker.gs.o -Wl,-z,now,--no-relax -o driver.linked
+gsfork-elf patch-plt driver.linked driver.gs
+gsfork-elf validate driver.gs
+```
+
+Object mode emits another ET_REL. The ordinary linker chooses symbol addresses and
+creates PLT entries. Use eager binding and disable instruction relaxation. Run the
+PLT pass once per linked executable or DSO. It checks recognized GNU ld slots,
+patches them in place, preserves ENDBR64 where present, and validates the translated
+jump against the original dynamic relocation. The final report covers the PLT
+only. The caller owns the instrumentation or trust decision for each input,
+including CRT code and libraries.
+
+For the reproducible GCC `cc1` and Clang object-first experiments, see
+[`tools/README.md`](tools/README.md).
+
+The object path decodes function bodies as instructions, accepts NOPs between
+functions, and assumes compiler-generated code without embedded data or hidden
+address constants. Unsized function symbols delimit bodies through the next function
+or section end; their symbol sizes remain zero. `.init`/`.fini` fragments also work
+without function symbols, including symbol-less CRT epilogues. Assembly sections
+without typed function symbols may use global/weak NOTYPE entry markers and aliases;
+these also delimit instruction-only bodies, not embedded data. It supports multiple
+functions per section, ordinary GS prefixes, local branches and RIP-relative
+references, PC32/PLT32/GOTPCREL-family and dynamic TLS operands, relative jump tables
+with explicitly referenced table bases, and absolute 64-bit code pointers in data.
+Symbol sizes, function alignment,
+instruction relocation offsets, code-target addends, and supported GNU x86-64
+`.eh_frame` ranges and CFI location advances follow instruction growth. Unchanged
+data and symbol indices remain available to the linker. The post-link pass and
+object mode both run without Ddisasm.
+
+Short branches are widened as needed, with layout recomputed until it stabilizes.
+LOOP/JCXZ-family branches use flag-preserving local trampolines when their short
+displacements overflow. CFI advances widen to larger encodings as needed; growing
+FDEs retain their CIE links, relocation offsets, and unwind states. Standard `zR`
+and `zPLR` GNU x86-64 CIEs are supported. Function-relative ULEB128 LSDA call-site
+ranges and landing pads are remapped while retaining action and type tables.
+Growing LSDA fields rebuild their headers, move subsequent records and type-table
+relocations, and update FDE references. Empty cold sections retain zero-range FDEs.
+MOVS/STOS use the shared canonical wrappers and require the explicit FS runtime
+slots described below. Unwind states that depend on their temporary registers
+are rejected. GNU ABI and SystemTap notes retain their relocated addresses.
+
+This prototype rejects debug sections, unsupported CFI/LSDA encodings, LEAVE
+expansions, and overflowing rel32 displacements. Compile without debug info for
+this path. Stripped or hand-written objects with missing function boundaries
+outside `.init`/`.fini` need another recovery strategy. The existing linked-ELF path remains available
+for its broader recovery and wrapper support.
 
 Repeat `--trust-library` for each `DT_NEEDED` library. C++ programs commonly also
 need `--trust-library libstdc++.so.6 --trust-library libgcc_s.so.1`. `-L DIR`

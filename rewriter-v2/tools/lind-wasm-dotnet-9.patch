@@ -1,0 +1,15 @@
+diff --git a/Docker/Dockerfile.mnt.dev b/Docker/Dockerfile.mnt.dev
+--- a/Docker/Dockerfile.mnt.dev
++++ b/Docker/Dockerfile.mnt.dev
+@@ -105,2 +105,11 @@
++# Install the final .NET 9 SDK and its native runtime dependencies.
++RUN apt-get update && \
++    apt-get install -y --no-install-recommends libicu70 libssl3 libgssapi-krb5-2 zlib1g && \
++    rm -rf /var/lib/apt/lists/* && \
++    curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh && \
++    bash /tmp/dotnet-install.sh --version 9.0.321 --install-dir /opt/dotnet && \
++    rm /tmp/dotnet-install.sh && \
++    ln -s /opt/dotnet/dotnet /usr/local/bin/dotnet
++
+ # --- Back to user for everything else ---
+ USER ${USERNAME}

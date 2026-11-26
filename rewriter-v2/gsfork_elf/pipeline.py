@@ -20,6 +20,7 @@ from pathlib import Path
 import gtirb
 import gtirb_rewriting.prepare
 from gtirb_rewriting import Constraints, Pass, PassManager, Patch
+from elftools.elf.elffile import ELFFile
 from iced_x86 import Decoder, Mnemonic, OpKind, Register
 
 from .elf import GNU_PROPERTY_X86_FEATURE_1_IBT, Image, x86_feature_properties
@@ -786,8 +787,25 @@ def recover_and_transform(source, work, image, metadata, runtime, trusted_sectio
             resolvers, reference_repairs, restored_names)
 
 
+def publish_stage(source, output, artifacts, mode, data, **details):
+    from .validator import validate_artifact
+
+    with workspace(output) as work:
+        staged = work / "output"
+        staged.write_bytes(data)
+        report = {"schema": 1, "mode": mode, "output": str(output),
+                  "input_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                  "output_sha256": hashlib.sha256(data).hexdigest(), **details}
+        report["validation"] = validate_artifact(staged, report)
+        write_report(work / "report.json", report)
+        staged.chmod(source.stat().st_mode & 0o755)
+        os.rename(work, artifacts)
+        os.rename(artifacts / "output", output)
+    return report
+
+
 def rewrite(input_path, output_path, *, baseline=False, runtime=Runtime(),
-            trusted_sections=(), trusted_libraries=(), library_paths=(), runtime_layout=None):
+            trusted_sections=(), trusted_libraries=(), library_paths=(), runtime_layout=None, plt_only=False):
     from .validator import validate_artifact
 
     runtime.check()
@@ -797,6 +815,19 @@ def rewrite(input_path, output_path, *, baseline=False, runtime=Runtime(),
         raise RewriteError(f"output or artifact directory already exists: {output}")
     if not output.parent.is_dir():
         raise RewriteError(f"output parent does not exist: {output.parent}")
+    if plt_only:
+        data, records = patch_plt(Image(source))
+        return publish_stage(source, output, artifacts, "plt-only", data, generated=records)
+    with source.open("rb") as stream:
+        relocatable = ELFFile(stream)["e_type"] == "ET_REL"
+    if relocatable:
+        from .objects import transform_object
+        if trusted_libraries or library_paths:
+            raise RewriteError("library options apply at link time")
+        data, counts = transform_object(source, runtime, trusted_sections, baseline)
+        return publish_stage(source, output, artifacts, "object-baseline" if baseline else "object-gs",
+                             data, sections=counts, trusted_sections=list(trusted_sections),
+                             runtime=asdict(runtime), runtime_layout=runtime_layout)
     image = Image(source)
     missing = set(image.libraries) - set(trusted_libraries)
     if missing and not baseline:
