@@ -39,6 +39,12 @@ operator's responsibility.
   source revisions, toolchain versions, configure flags and input manifests
   when comparing runs; compiler outputs can differ between machines.
 
+For the separate SURI workflow, `lind-wasm-dotnet-9.patch` contains the .NET 9
+SDK addition to `lind-wasm/Docker/Dockerfile.mnt.dev` (based on Lind commit
+`7863fbeea`). Apply it from the `lind-wasm` checkout with
+`git apply /path/to/gsfork-prototype/rewriter-v2/tools/lind-wasm-dotnet-9.patch`
+and rebuild the image. .NET is not required for this object-first workflow.
+
 The examples use the existing committed compiler wrappers, which select the
 custom glibc at link time. Set absolute paths for your checkouts and output
 location; use a writable scratch directory with sufficient disk space.
