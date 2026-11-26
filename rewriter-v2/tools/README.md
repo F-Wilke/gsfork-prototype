@@ -45,6 +45,12 @@ SDK addition to `lind-wasm/Docker/Dockerfile.mnt.dev` (based on Lind commit
 `git apply /path/to/gsfork-prototype/rewriter-v2/tools/lind-wasm-dotnet-9.patch`
 and rebuild the image. .NET is not required for this object-first workflow.
 
+`suri-cc1-experiment.patch` preserves the separate experimental SURI
+compatibility edits, based on SURI commit `4f66872a9597f0c18cd3ff45516ac25d600b4576`.
+Apply with `git apply --unidiff-zero /path/to/gsfork-prototype/rewriter-v2/tools/suri-cc1-experiment.patch`.
+These changes did **not** produce a runnable rewritten `cc1`; they are retained
+for investigation, not as a working SURI solution.
+
 The examples use the existing committed compiler wrappers, which select the
 custom glibc at link time. Set absolute paths for your checkouts and output
 location; use a writable scratch directory with sufficient disk space.

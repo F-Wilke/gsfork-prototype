@@ -1,0 +1,135 @@
+diff --git a/superSymbolizer/CustomCompiler.py b/superSymbolizer/CustomCompiler.py
+index 27f4a61..4bfcd4b 100644
+--- a/superSymbolizer/CustomCompiler.py
++++ b/superSymbolizer/CustomCompiler.py
+@@ -113 +113 @@ def emitter(target, reassem_path, output, page_size=0x200000, asan=False, verbos
+-    compiler = '/usr/bin/gcc-11'
++    compiler = '/usr/bin/gcc'
+@@ -123 +123 @@ def emitter(target, reassem_path, output, page_size=0x200000, asan=False, verbos
+-            compiler = '/usr/bin/g++-11'
++            compiler = '/usr/bin/g++'
+@@ -136 +136 @@ def emitter(target, reassem_path, output, page_size=0x200000, asan=False, verbos
+-    #lopt += ' -Wl,--section-start=.interp=%s -Wl,--section-start=.note.ABI-tag=0x1000,--section-start=.my_rodata=%s'%\
++    #lopt += ' -Wl,--section-start=.interp=%s,--section-start=.my_rodata=%s'%\
+@@ -138 +138 @@ def emitter(target, reassem_path, output, page_size=0x200000, asan=False, verbos
+-    lopt += ' -Wl,--section-start=.interp=%s -Wl,--section-start=.note.ABI-tag=0x1000'%\
++    lopt += ' -Wl,--section-start=.interp=%s'%\
+diff --git a/superSymbolizer/ElfBricks.py b/superSymbolizer/ElfBricks.py
+index 789502a..289ca49 100644
+--- a/superSymbolizer/ElfBricks.py
++++ b/superSymbolizer/ElfBricks.py
+@@ -255,0 +256 @@ class ElfBricks:
++                                    rela_plt_list,
+@@ -369,0 +371,17 @@ class ElfBricks:
++        if len(data) % 8:
++            data += b'\x00' * (8 - len(data) % 8)
++
++        cur_offset = len(data) + base_offset
++        cur_addr = len(data) + base_addr
++        rela_plt = b''.join(Pack(entry) for entry in rela_plt_list)
++        dyn_dict[DynamicArrayTag.DT_PLTRELSZ] = len(rela_plt)
++        dyn_dict[DynamicArrayTag.DT_PLTREL] = DynamicArrayTag.DT_RELA
++        dyn_dict[DynamicArrayTag.DT_JMPREL] = cur_addr
++        data += rela_plt
++        sec_header = self.create_dummy_section_header(
++            cur_addr, cur_offset, len(rela_plt),
++            type=int(SectionType.SHT_RELA),
++            flags=int(SectionFlag.SHF_ALLOC),
++            align=8, entsize=0x18)
++        new_section_header_list.append(('.rela.plt', sec_header))
++
+@@ -892,0 +911,6 @@ class ElfBricks:
++            elif sec_name == '.rela.plt':
++                old_rela_plt_idx = next(
++                    idx for idx, section in enumerate(self._sec_list)
++                    if section.name == '.rela.plt')
++                sec_header.sh_name = self._sec_list[old_rela_plt_idx].header.sh_name
++                sec_header.sh_link = new_dynsym_idx
+@@ -917 +941,3 @@ class ElfBricks:
+-        zeros = b'\x00' * (new_base - len(additional_data))
++        pad = max(0, new_base - len(additional_data))
++        pad += (self._offset_range.start - len(additional_data) - pad) % 0x1000
++        zeros = b'\x00' * pad
+@@ -931,0 +958,11 @@ class ElfBricks:
++        for prog_header in self._program_header_list:
++            if prog_header.p_type == int(ProgramType.PT_INTERP):
++                interp_data = self._data[
++                    prog_header.p_offset:prog_header.p_offset + prog_header.p_filesz]
++                interp_offset = prog_header.p_offset + additional_offset
++                self.new_data = (
++                    self.new_data[:interp_offset] +
++                    interp_data +
++                    self.new_data[interp_offset + len(interp_data):])
++                break
++
+@@ -954,0 +992,5 @@ class ElfBricks:
++        base_idx = len(elfBricks._dynsym) // 0x18
++        for rela in self._rela_plt_list:
++            r_idx = rela.r_info >> 32
++            if r_idx:
++                rela.r_info = ((base_idx + r_idx) << 32) | (rela.r_info & 0xffffffff)
+@@ -962,0 +1005 @@ class ElfBricks:
++                self._rela_plt_list,
+@@ -986 +1028,0 @@ class ElfBricks:
+-        self.update_plt_sec(elfBricks, new_dynstr)
+diff --git a/superSymbolizer/SuperSymbolizer.py b/superSymbolizer/SuperSymbolizer.py
+index 02a950e..5953f33 100644
+--- a/superSymbolizer/SuperSymbolizer.py
++++ b/superSymbolizer/SuperSymbolizer.py
+@@ -49,0 +50,2 @@ class SuperSymbolizer:
++        self.cfi_proc = False
++        self.cfi_state_depth = 0
+@@ -166 +168,5 @@ class SuperSymbolizer:
+-        assert main_fun
++        if main_fun is None:
++            for symbol in self.elfBrick._symtab_dict.get('main', []):
++                address = hex(symbol.st_value)
++                if address in self.fun_info_dict:
++                    return self.fun_info_dict[address].label
+@@ -180,0 +187,5 @@ class SuperSymbolizer:
++        for symbol in self.elfBrick._dynsym_list:
++            if symbol.st_shndx == 0 and symbol.st_info >> 4 == 2:
++                name = self.elfBrick._dynstr[symbol.st_name:].split(b'\0', 1)[0].decode('utf-8')
++                self.write_code('.weak ' + name)
++
+@@ -580,0 +592,15 @@ class SuperSymbolizer:
++        directive = line.strip()
++        if directive.startswith('.cfi_startproc'):
++            self.cfi_proc = True
++            self.cfi_state_depth = 0
++        elif directive == '.cfi_endproc':
++            self.cfi_proc = False
++            self.cfi_state_depth = 0
++        elif self.cfi_proc and directive == '.cfi_remember_state':
++            self.cfi_state_depth += 1
++        elif self.cfi_proc and directive == '.cfi_restore_state':
++            if self.cfi_state_depth == 0:
++                print('\t.cfi_remember_state', file=self.fd)
++            else:
++                self.cfi_state_depth -= 1
++
+diff --git a/superSymbolizer/lib/CFIInfo.py b/superSymbolizer/lib/CFIInfo.py
+index 55f7902..3a018ec 100644
+--- a/superSymbolizer/lib/CFIInfo.py
++++ b/superSymbolizer/lib/CFIInfo.py
+@@ -353,0 +354,3 @@ class FDE_REC:
++        if opcode == 0x9:
++            return ('DW_CFA_register: r%s in r%s'%(self.reg_info(inst.args[0]), self.reg_info(inst.args[1])),
++                    '.cfi_register %d, %d'%(inst.args[0], inst.args[1]))
+diff --git a/superSymbolizer/lib/ExceptTable.py b/superSymbolizer/lib/ExceptTable.py
+index 7cf7cdb..3d71fe5 100644
+--- a/superSymbolizer/lib/ExceptTable.py
++++ b/superSymbolizer/lib/ExceptTable.py
+@@ -215,0 +216,10 @@ class GCCExceptTable:
++            if not action_set:
++                # With no call sites, the action and type entries are unreferenced.
++                return {
++                    'header': header,
++                    'csHeader': csHeader,
++                    'region_tbl': region_table,
++                    'action': LSDA_ACTION_TABLE(b''),
++                    'type_tbl': None,
++                }, header.size + header.end_offset
++
+@@ -530 +539,0 @@ class EHTable:
+-
